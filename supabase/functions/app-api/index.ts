@@ -87,8 +87,12 @@ async function actorFromRequest(req: Request) {
   return { token, user, roles: (roleRows ?? []).map((row) => row.role as string) }
 }
 
+function hasRole(actor: Awaited<ReturnType<typeof actorFromRequest>>, role: string) {
+  return actor.roles.includes(role) || actor.roles.includes('admin')
+}
+
 function requireRole(actor: Awaited<ReturnType<typeof actorFromRequest>>, role: string) {
-  if (!actor.roles.includes(role)) throw new HttpError('没有对应操作权限。', 403)
+  if (!hasRole(actor, role)) throw new HttpError('没有对应操作权限。', 403)
 }
 
 async function rpc(name: string, args: Record<string, unknown>) {
@@ -230,7 +234,7 @@ async function handle(req: Request) {
     const { data: application, error: applicationError } = await admin.from('applications').select('id,owner_id,status').eq('id', applicationId).maybeSingle()
     if (applicationError || !application) throw new HttpError('申请不存在。', 404)
     if (application.owner_id !== actor.user.id && actor.roles.length === 0) throw new HttpError('没有权限。', 403)
-    if (kind === 'receipt' && !actor.roles.includes('cashier') && !actor.roles.includes('admin')) throw new HttpError('没有付款登记权限。', 403)
+    if (kind === 'receipt' && !hasRole(actor, 'cashier')) throw new HttpError('没有付款登记权限。', 403)
     const safeName = file.name.replace(/[^a-zA-Z0-9._-]/g, '_').slice(-120) || 'file'
     const storagePath = `${application.owner_id}/${applicationId}/${kind}-${crypto.randomUUID()}-${safeName}`
     const upload = await admin.storage.from(bucket).upload(storagePath, new Uint8Array(await file.arrayBuffer()), { upsert: false, contentType: file.type || 'application/octet-stream' })
