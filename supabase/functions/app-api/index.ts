@@ -210,17 +210,38 @@ async function handle(req: Request) {
     if (!application || (application.owner_id !== actor.user.id && actor.roles.length === 0)) throw new HttpError('申请不存在或无权查看。', 404)
     const [profileResult, fileResult, actionResult, paymentResult] = await Promise.all([
       admin.from('profiles').select('full_name').eq('id', application.owner_id).maybeSingle(),
-      admin.from('application_files').select('*').eq('application_id', id).order('created_at'),
+      admin.from('application_files').select('*').eq('application_id', id).is('removed_at', null).order('created_at'),
       admin.from('approval_actions').select('*').eq('application_id', id).order('created_at', { ascending: false }),
       admin.from('payments').select('*').eq('application_id', id).maybeSingle(),
     ])
     if (fileResult.error || actionResult.error || paymentResult.error) throw new Error('申请详情读取失败。')
-    return ok({ application, ownerName: profileResult.data?.full_name ?? '成员', files: fileResult.data ?? [], actions: actionResult.data ?? [], payment: paymentResult.data ?? null })
+    const visibleFiles = (fileResult.data ?? []).filter((file) => !file.pending ||
+      (file.kind === 'qr' && application.owner_id === actor.user.id) ||
+      (file.kind === 'receipt' && application.owner_id !== actor.user.id && hasRole(actor, 'cashier')))
+    return ok({ application, ownerName: profileResult.data?.full_name ?? '成员', files: visibleFiles, actions: actionResult.data ?? [], payment: paymentResult.data ?? null })
   }
 
   if (['submit_application', 'approve_application', 'return_application', 'reject_application', 'cancel_application'].includes(action)) {
     const functionName = `app_${action}`
     await rpc(functionName, { p_application_id: requiredString(body.application_id, '缺少申请编号。'), p_actor_id: actor.user.id, p_note: String(body.note ?? '').trim() })
+    return ok(null)
+  }
+
+  if (action === 'remove_file') {
+    await rpc('app_remove_application_file', {
+      p_application_id: requiredString(body.application_id, '缺少申请编号。'), p_actor_id: actor.user.id,
+      p_file_id: requiredString(body.file_id, '缺少文件编号。'),
+    })
+    return ok(null)
+  }
+
+  if (action === 'save_file_draft' || action === 'submit_file_draft') {
+    const args = {
+      p_application_id: requiredString(body.application_id, '缺少申请编号。'), p_actor_id: actor.user.id,
+      p_file_id: requiredString(body.file_id, '请先选择并保存文件。'), p_value: String(body.value ?? '').trim(),
+    }
+    if (action === 'save_file_draft') await rpc('app_update_workflow_draft', args)
+    else await rpc('app_submit_workflow_file', { ...args, p_confirmed: body.confirmed === true })
     return ok(null)
   }
 
@@ -231,30 +252,36 @@ async function handle(req: Request) {
     const applicationId = requiredString(body.application_id, '缺少申请编号。')
     const kind = requiredString(body.kind, '缺少文件类型。')
     if (!['attachment', 'qr', 'receipt'].includes(kind)) throw new HttpError('文件类型不支持。')
+    if (!['image/png', 'image/jpeg', 'application/pdf'].includes(file.type) || (kind === 'qr' && file.type === 'application/pdf')) throw new HttpError('请选择 PNG、JPG 图片或 PDF 文件。')
     const { data: application, error: applicationError } = await admin.from('applications').select('id,owner_id,status').eq('id', applicationId).maybeSingle()
     if (applicationError || !application) throw new HttpError('申请不存在。', 404)
-    if (application.owner_id !== actor.user.id && actor.roles.length === 0) throw new HttpError('没有权限。', 403)
-    if (kind === 'receipt' && !hasRole(actor, 'cashier')) throw new HttpError('没有付款登记权限。', 403)
+    if (kind === 'attachment' && (application.owner_id !== actor.user.id || !['draft','changes_requested','finance_pending','chair_pending','payment_info_required','payment_pending'].includes(application.status))) throw new HttpError('当前不能修改申请附件。', 403)
+    if (kind === 'qr' && (application.owner_id !== actor.user.id || !['payment_info_required','payment_pending'].includes(application.status))) throw new HttpError('当前不能修改收款信息。', 403)
+    if (kind === 'receipt' && (application.owner_id === actor.user.id || !hasRole(actor, 'cashier') || !['payment_pending','paid'].includes(application.status))) throw new HttpError('没有付款登记权限。', 403)
     const safeName = file.name.replace(/[^a-zA-Z0-9._-]/g, '_').slice(-120) || 'file'
     const storagePath = `${application.owner_id}/${applicationId}/${kind}-${crypto.randomUUID()}-${safeName}`
     const upload = await admin.storage.from(bucket).upload(storagePath, new Uint8Array(await file.arrayBuffer()), { upsert: false, contentType: file.type || 'application/octet-stream' })
     if (upload.error) throw new Error(upload.error.message)
+    let fileId
     try {
-      if (kind === 'attachment') await rpc('app_add_application_file', { p_application_id: applicationId, p_actor_id: actor.user.id, p_kind: kind, p_storage_path: storagePath, p_name: file.name, p_mime: file.type || 'application/octet-stream' })
-      if (kind === 'qr') await rpc('app_submit_payment_info', { p_application_id: applicationId, p_actor_id: actor.user.id, p_recipient: requiredString(body.recipient, '请输入收款人姓名。'), p_storage_path: storagePath, p_name: file.name, p_mime: file.type || 'application/octet-stream' })
-      if (kind === 'receipt') await rpc('app_record_payment', { p_application_id: applicationId, p_actor_id: actor.user.id, p_reference: requiredString(body.reference, '请输入支付宝流水号。'), p_storage_path: storagePath, p_name: file.name, p_mime: file.type || 'application/octet-stream' })
+      fileId = await rpc('app_save_workflow_file', {
+        p_application_id: applicationId, p_actor_id: actor.user.id, p_kind: kind,
+        p_storage_path: storagePath, p_name: file.name, p_mime: file.type,
+        p_value: String(body.value ?? (kind === 'qr' ? body.recipient : body.reference) ?? '').trim(),
+      })
     } catch (error) {
       await admin.storage.from(bucket).remove([storagePath])
       throw error
     }
-    return ok({ path: storagePath })
+    return ok({ path: storagePath, file_id: fileId })
   }
 
   if (action === 'file_url') {
     const path = requiredString(body.path, '缺少文件地址。')
-    const { data: file, error: fileError } = await admin.from('application_files').select('application_id,owner_id').eq('storage_path', path).maybeSingle()
+    const { data: file, error: fileError } = await admin.from('application_files').select('application_id,owner_id,kind,pending').eq('storage_path', path).is('removed_at', null).maybeSingle()
     if (fileError || !file) throw new HttpError('文件不存在。', 404)
     if (file.owner_id !== actor.user.id && actor.roles.length === 0) throw new HttpError('没有权限。', 403)
+    if (file.pending && !((file.kind === 'qr' && file.owner_id === actor.user.id) || (file.kind === 'receipt' && file.owner_id !== actor.user.id && hasRole(actor, 'cashier')))) throw new HttpError('没有草稿文件查看权限。', 403)
     const { data, error } = await admin.storage.from(bucket).createSignedUrl(path, 300)
     if (error) throw new Error(error.message)
     return ok({ signedUrl: data.signedUrl })
