@@ -1,0 +1,33 @@
+begin;
+do $verify_admin_settings$
+declare a uuid; u uuid; ordinary uuid; r jsonb; rec public.audit_logs%rowtype; app uuid;
+begin
+  perform set_config('request.headers','{"x-audit-ip":"203.0.113.10","x-audit-ip-source":"x-forwarded-for","x-audit-action":"test","x-audit-request-id":"00000000-0000-4000-8000-000000000001"}',true);
+  r := private.app_insert_user('verify_admin_'||substr(gen_random_uuid()::text,1,8),'Test-only-1369666','测试管理员','测试'); a := (r->>'id')::uuid;
+  insert into public.user_roles(user_id,role) values(a,'admin');
+  r := private.app_insert_user('verify_user_'||substr(gen_random_uuid()::text,1,8),'Test-only-1369666','测试成员','测试'); ordinary := (r->>'id')::uuid;
+  perform public.app_update_registration(a,false);
+  begin perform public.app_create_user('verify_closed_user','Test-only-1369666','测试',''); raise exception 'registration unexpectedly allowed'; exception when raise_exception then if SQLERRM='registration unexpectedly allowed' then raise; end if; end;
+  begin perform public.app_update_registration(ordinary,true); raise exception 'ordinary settings unexpectedly allowed'; exception when raise_exception then if SQLERRM='ordinary settings unexpectedly allowed' then raise; end if; end;
+  r := public.app_admin_create_user(a,'verify_added_'||substr(gen_random_uuid()::text,1,8),'Test-only-1369666','新用户','技术部',array['finance']); u := (r->>'id')::uuid;
+  if not exists(select 1 from public.user_roles where user_id=u and role='finance') then raise exception 'missing role'; end if;
+  begin perform public.app_admin_create_user(ordinary,'verify_forbidden','Test-only-1369666','不允许','',array['admin']); raise exception 'ordinary create unexpectedly allowed'; exception when raise_exception then if SQLERRM='ordinary create unexpectedly allowed' then raise; end if; end;
+  begin perform public.app_set_member_roles(a,u,array['cashier'],true); raise exception 'cashier unexpectedly allowed'; exception when raise_exception then if SQLERRM='cashier unexpectedly allowed' then raise; end if; end;
+  begin perform public.app_admin_create_user(a,upper(r->>'username'),'Test-only-1369666','重复','',array[]::text[]); raise exception 'duplicate unexpectedly allowed'; exception when raise_exception then if SQLERRM='duplicate unexpectedly allowed' then raise; end if; end;
+  if exists(select 1 from public.audit_logs where metadata::text like '%Test-only-1369666%') then raise exception 'password leaked into audit'; end if;
+  select * into rec from public.audit_logs where actor_id=a and event='添加用户' order by id desc limit 1;
+  if rec.ip_address<>'203.0.113.10' or rec.username='' or rec.detail not like '%新用户%' or rec.request_id is null then raise exception 'audit context incomplete'; end if;
+  perform set_config('request.headers',jsonb_build_object('x-audit-ip','203.0.113.11','x-audit-actor',ordinary,'x-audit-action','update_application')::text,true);
+  insert into public.applications(owner_id,title,purpose,amount,category,department,use_date) values(ordinary,'测试申请','测试用途',19,'测试','测试',current_date) returning id into app;
+  update public.applications set amount=29,title='修改后的申请' where id=app;
+  select * into rec from public.audit_logs where actor_id=ordinary and event='修改申请' order by id desc limit 1;
+  if rec.metadata->'changes'->'amount'->>'原值'<>'19.00' or rec.metadata->'changes'->'amount'->>'新值'<>'29.00' or rec.ip_address<>'203.0.113.11' or rec.detail not like '%修改后的申请%' then raise exception 'edit audit incomplete'; end if;
+  perform public.app_submit_application(app,ordinary,'');
+  perform public.app_approve_application(app,a,'具体通过理由');
+  select * into rec from public.audit_logs where actor_id=a and event='处理申请' order by id desc limit 1;
+  if rec.detail not like '%审批通过%' or rec.detail not like '%具体通过理由%' then raise exception 'review audit incomplete'; end if;
+  perform public.app_update_registration(a,true);
+  r := public.app_create_user('verify_open_'||substr(gen_random_uuid()::text,1,8),'Test-only-1369666','开放注册','');
+  if exists(select 1 from public.user_roles where user_id=(r->>'id')::uuid) then raise exception 'registration escalated privileges'; end if;
+end $verify_admin_settings$;
+rollback;

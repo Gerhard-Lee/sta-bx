@@ -5,9 +5,16 @@ const secretKeys = Deno.env.get('SUPABASE_SECRET_KEYS')
 const secretKey = secretKeys
   ? JSON.parse(secretKeys).default
   : (Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? '')
-const admin = createClient(supabaseUrl, secretKey, {
-  auth: { autoRefreshToken: false, persistSession: false, detectSessionInUrl: false },
-})
+function createAdmin(req: Request, requestId: string, action = '', actorId = '') {
+  const source = ['cf-connecting-ip', 'x-real-ip', 'x-forwarded-for'].find((key) => req.headers.get(key))
+  const address = source ? req.headers.get(source)?.split(',')[0].trim() ?? '' : ''
+  const ip = /^[0-9a-fA-F:.]{3,64}$/.test(address) ? address : ''
+  return createClient(supabaseUrl, secretKey, {
+    auth: { autoRefreshToken: false, persistSession: false, detectSessionInUrl: false },
+    global: { headers: { 'x-audit-ip': ip, 'x-audit-ip-source': ip ? source! : '', 'x-audit-action': action, 'x-audit-actor': actorId, 'x-audit-request-id': requestId } },
+  })
+}
+type AdminClient = ReturnType<typeof createAdmin>
 
 const bucket = 'application-files'
 const corsHeaders = {
@@ -51,7 +58,7 @@ function randomToken() {
   return btoa(String.fromCharCode(...bytes)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
 }
 
-async function issueSession(userId: string) {
+async function issueSession(userId: string, admin: AdminClient) {
   const token = randomToken()
   const tokenHash = await sha256Hex(token)
   const expiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString()
@@ -60,7 +67,7 @@ async function issueSession(userId: string) {
   return { token, expiresAt }
 }
 
-async function actorFromRequest(req: Request) {
+async function actorFromRequest(req: Request, admin: AdminClient) {
   const token = getSessionToken(req)
   if (!token) throw new HttpError('请先登录。', 401)
   const tokenHash = await sha256Hex(token)
@@ -95,12 +102,6 @@ function requireRole(actor: Awaited<ReturnType<typeof actorFromRequest>>, role: 
   if (!hasRole(actor, role)) throw new HttpError('没有对应操作权限。', 403)
 }
 
-async function rpc(name: string, args: Record<string, unknown>) {
-  const result = await admin.rpc(name, args)
-  if (result.error) throw new Error(result.error.message)
-  return result.data
-}
-
 async function readRequest(req: Request) {
   const contentType = req.headers.get('content-type') ?? ''
   if (contentType.includes('multipart/form-data')) {
@@ -126,6 +127,23 @@ async function handle(req: Request) {
   if (req.method !== 'POST') throw new HttpError('请求方式不支持。', 405)
   const body = await readRequest(req) as Record<string, unknown>
   const action = requiredString(body.action, '缺少操作类型。')
+  const requestId = crypto.randomUUID()
+  let admin = createAdmin(req, requestId, action)
+  const rpc = async (name: string, args: Record<string, unknown>) => {
+    const result = await admin.rpc(name, args)
+    if (result.error) throw new HttpError(result.error.message)
+    return result.data
+  }
+  const audit = async (actorId: string, event: string, detail: string, metadata: Record<string, unknown> = {}) => {
+    const { error } = await admin.from('audit_logs').insert({ actor_id: actorId, event, detail, metadata })
+    if (error) throw new Error('操作日志保存失败。')
+  }
+
+  if (action === 'public_settings') {
+    const { data, error } = await admin.from('settings').select('registration_enabled').eq('id', 1).single()
+    if (error) throw new Error('注册设置读取失败。')
+    return ok(data)
+  }
 
   if (action === 'register') {
     const result = await rpc('app_create_user', {
@@ -134,7 +152,7 @@ async function handle(req: Request) {
       p_full_name: String(body.full_name ?? '').trim(),
       p_department: String(body.department ?? '').trim(),
     })
-    const session = await issueSession(result.id)
+    const session = await issueSession(result.id, admin)
     return ok({ user: result, roles: result.roles ?? [], session })
   }
 
@@ -144,17 +162,22 @@ async function handle(req: Request) {
       p_password: requiredString(body.password, '请输入密码。'),
     })
     if (!result) throw new HttpError('用户名或密码不正确。', 401)
-    const session = await issueSession(result.id)
+    admin = createAdmin(req, requestId, action, result.id)
+    const session = await issueSession(result.id, admin)
+    await audit(result.id, '登录账号', '用户 @' + result.username)
     return ok({ user: result, roles: result.roles ?? [], session })
   }
 
   if (action === 'logout') {
-    const token = getSessionToken(req)
-    if (token) await admin.from('app_sessions').delete().eq('token_hash', await sha256Hex(token))
+    const actor = await actorFromRequest(req, admin)
+    admin = createAdmin(req, requestId, action, actor.user.id)
+    await audit(actor.user.id, '退出账号', '用户 @' + actor.user.username)
+    await admin.from('app_sessions').delete().eq('token_hash', await sha256Hex(actor.token))
     return ok(null)
   }
 
-  const actor = await actorFromRequest(req)
+  const actor = await actorFromRequest(req, admin)
+  admin = createAdmin(req, requestId, action, actor.user.id)
 
   if (action === 'me') return ok({ user: actor.user, roles: actor.roles })
 
@@ -248,7 +271,7 @@ async function handle(req: Request) {
   if (action === 'upload_file') {
     const file = body.file
     if (!(file instanceof File)) throw new HttpError('请选择文件。')
-    if (file.size > 5 * 1024 * 1024) throw new HttpError('文件不能超过 5 MB。')
+    if (!file.size || file.size > 5 * 1024 * 1024) throw new HttpError('文件不能为空或超过 5 MB。')
     const applicationId = requiredString(body.application_id, '缺少申请编号。')
     const kind = requiredString(body.kind, '缺少文件类型。')
     if (!['attachment', 'qr', 'receipt'].includes(kind)) throw new HttpError('文件类型不支持。')
@@ -292,11 +315,55 @@ async function handle(req: Request) {
     const [usersResult, rolesResult, settingResult, auditResult] = await Promise.all([
       admin.from('app_users').select('id,username,full_name,department,active').order('full_name'),
       admin.from('user_roles').select('user_id,role'),
-      admin.from('settings').select('threshold').eq('id', 1).single(),
-      admin.from('audit_logs').select('*').order('created_at', { ascending: false }).limit(50),
+      admin.from('settings').select('threshold,registration_enabled').eq('id', 1).single(),
+      admin.from('audit_logs').select('*').order('created_at', { ascending: false }).order('id', { ascending: false }).limit(50),
     ])
     if (usersResult.error || rolesResult.error || settingResult.error || auditResult.error) throw new Error('管理数据读取失败。')
-    return ok({ profiles: usersResult.data ?? [], roles: rolesResult.data ?? [], threshold: settingResult.data.threshold, audit: auditResult.data ?? [] })
+    const names = new Map((usersResult.data ?? []).map((u) => [u.id, u.username]))
+    const logs = (auditResult.data ?? []).map((row) => ({ ...row, username: row.username || names.get(row.actor_id) || '系统' }))
+    return ok({ profiles: usersResult.data ?? [], roles: rolesResult.data ?? [], threshold: settingResult.data.threshold, registration_enabled: settingResult.data.registration_enabled, audit: logs })
+  }
+
+  if (action === 'update_registration') {
+    requireRole(actor, 'admin')
+    if (typeof body.enabled !== 'boolean') throw new HttpError('请选择是否允许注册。')
+    await rpc('app_update_registration', { p_actor_id: actor.user.id, p_enabled: body.enabled })
+    return ok(null)
+  }
+
+  if (action === 'admin_create_user') {
+    requireRole(actor, 'admin')
+    const result = await rpc('app_admin_create_user', {
+      p_actor_id: actor.user.id, p_username: requiredString(body.username, '请输入用户名。'),
+      p_password: requiredString(body.password, '请输入初始密码。'), p_full_name: requiredString(body.full_name, '请输入姓名。'),
+      p_department: String(body.department ?? '').trim(), p_roles: Array.isArray(body.roles) ? body.roles : [],
+    })
+    return ok(result)
+  }
+
+  if (action === 'export_financial' || action === 'export_audit') {
+    requireRole(actor, 'admin')
+    const start = String(body.start ?? '').trim(), end = String(body.end ?? '').trim()
+    const validDate = (v: string) => /^\d{4}-\d{2}-\d{2}$/.test(v) && Number.isFinite(Date.parse(v)) && new Date(v).toISOString().slice(0, 10) === v
+    if ((start && !validDate(start)) || (end && !validDate(end)) || (start && end && start > end)) throw new HttpError('请选择有效的日期范围。')
+    const table = action === 'export_financial' ? 'payments' : 'audit_logs'
+    const rows: Record<string, any>[] = []
+    for (let offset = 0; ; offset += 1000) {
+      let query = admin.from(table).select(action === 'export_financial' ? '*,applications(*)' : '*').order('created_at').order(action === 'export_financial' ? 'application_id' : 'id').range(offset, offset + 999)
+      if (start) query = query.gte('created_at', start + 'T00:00:00+08:00')
+      if (end) query = query.lt('created_at', new Date(Date.parse(end + 'T00:00:00+08:00') + 86400000).toISOString())
+      const { data, error } = await query
+      if (error) throw new Error('导出数据读取失败。')
+      rows.push(...(data ?? []))
+      if ((data ?? []).length < 1000) break
+      if (rows.length >= 100000) throw new HttpError('数据较多，请缩小日期范围后导出。')
+    }
+    const { data: users, error } = await admin.from('app_users').select('id,username,full_name')
+    if (error) throw new Error('用户信息读取失败。')
+    const userMap = new Map((users ?? []).map((u) => [u.id, u]))
+    const result = rows.map((row) => action === 'export_financial' ? { ...row, applicant: userMap.get(row.applications?.owner_id)?.full_name || '', username: userMap.get(row.applications?.owner_id)?.username || '', operator: userMap.get(row.actor_id)?.username || '' } : { ...row, username: row.username || userMap.get(row.actor_id)?.username || '系统' })
+    await audit(actor.user.id, action === 'export_financial' ? '导出财报' : '导出操作日志', `${start || '全部'} 至 ${end || '现在'} · ${result.length} 条`, { start, end, count: result.length })
+    return ok({ rows: result, start, end, generated_at: new Date().toISOString() })
   }
 
   if (action === 'set_member_roles') {

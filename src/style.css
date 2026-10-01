@@ -7,3 +7,24 @@ fieldset{border:0;padding:0;margin:0;min-width:0}
 .file-picker .hint{color:#8592a6;font-size:.8rem;line-height:1.6}.file-row span{overflow-wrap:anywhere;min-width:0}.file-row small{font-size:.75rem}
 .action-block label{display:block;color:#53617a;font-size:.9375rem;margin-bottom:16px}.action-block label.check-row{display:flex;align-items:flex-start;line-height:1.6}.action-block .check-row input{flex-shrink:0;margin-top:3px}.action-block select{width:100%}
 @media(max-width:620px){.form-actions .button{flex-grow:1;min-height:44px}.file-row{flex-wrap:wrap}.file-remove{min-width:40px;min-height:40px}}
+.sta-logo{width:84px;height:50px;object-fit:cover;object-position:center;flex-shrink:0;border-radius:8px;background:#fff}
+.sta-brand{display:flex;flex-direction:column;gap:3px;text-align:left;line-height:1.4;letter-spacing:0}
+.sta-brand strong{font-weight:650;font-size:1rem;white-space:nowrap}
+.sta-brand>span{font-size:.85rem;color:#7c889b}
+.auth-brand{display:flex;gap:14px;align-items:center;margin-bottom:30px}
+.auth-page .auth-card{width:min(100%,480px)}
+.settings-grid.admin-settings{grid-template-columns:1fr 1fr;gap:24px}
+.admin-section{margin-top:24px}
+.admin-settings label{display:block;font-size:.9375rem;color:#53617a;margin-bottom:16px}
+.admin-settings .check-row{display:flex;margin-bottom:12px}
+.role-choices,.export-actions{display:flex;align-items:center;gap:16px;flex-wrap:wrap}
+.audit-table table{min-width:1080px}
+.audit-time{font-variant-numeric:tabular-nums;white-space:nowrap;font-size:.875rem}
+.audit-ip{font-family:ui-monospace,monospace;font-size:.8rem;overflow-wrap:anywhere;max-width:190px}
+.audit-detail{min-width:350px;max-width:620px;overflow-wrap:anywhere;font-size:.875rem;white-space:pre-wrap}
+.admin-settings .registration-switch input{appearance:none;width:40px;height:24px;border:0;border-radius:999px;background:#cbd5e1;position:relative;cursor:pointer;transition:background .18s;flex-shrink:0}
+.admin-settings .registration-switch input:before{content:"";position:absolute;left:3px;top:3px;width:18px;height:18px;border-radius:50%;background:white;box-shadow:0 1px 3px #26355122;transition:transform .18s}
+.admin-settings .registration-switch input:checked{background:#315fe8}
+.admin-settings .registration-switch input:checked:before{transform:translateX(16px)}
+@media(max-width:900px){.settings-grid.admin-settings{grid-template-columns:1fr}.sta-brand strong{font-size:.9rem}.sta-logo{width:70px;height:44px}}
+@media(max-width:620px){.topbar .brand-button{gap:8px}.sta-logo{width:58px;height:38px}.sta-brand strong{font-size:.83rem}.sta-brand>span{font-size:.75rem}.auth-brand .sta-logo{width:75px;height:46px}.auth-brand .sta-brand strong{font-size:.93rem}.topbar .user-menu{font-size:.8rem}}

@@ -3,6 +3,7 @@ import { createRoot } from 'react-dom/client';
 import './style.css';
 import { apiRequest } from './api.js';
 import { ApplicationForm, ApplicationDetail } from './workflow.jsx';
+import { AdminPanel } from './admin.jsx';
 
 const supabaseUrl = import.meta.env.VITE_SUPABASE_URL;
 const supabaseKey = import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY;
@@ -13,11 +14,10 @@ const STATUS = {
   changes_requested: '退回修改', rejected: '已拒绝', payment_info_required: '待补充收款码',
   payment_pending: '待付款', paid: '已付款', cancelled: '已撤回'
 };
-const ROLE_LABEL = { finance: '财委', chair: '主席', cashier: '财务', admin: '管理员' };
 
 const money = (value) => `¥${Number(value || 0).toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 const dateText = (value) => value ? new Date(value).toLocaleDateString('zh-CN', { year: 'numeric', month: 'numeric', day: 'numeric' }) : '—';
-const dateTime = (value) => value ? new Date(value).toLocaleString('zh-CN', { dateStyle: 'medium', timeStyle: 'short' }) : '—';
+function Brand() { return <><img className="sta-logo" src="/sta-logo.jpg" alt="成都七中科学技术协会 Logo" /><span className="sta-brand"><strong>成都七中科学技术协会</strong><span>财务报销平台</span></span></>; }
 
 function ErrorText({ error }) { return error ? <div className="error-text" role="alert">{error}</div> : null; }
 function StatusBadge({ status }) { return <span className={`status ${status}`}>{STATUS[status] || status}</span>; }
@@ -26,11 +26,13 @@ function Spinner() { return <span className="spinner" aria-label="加载中" />;
 
 
 function AuthScreen() {
+  const [registration, setRegistration] = useState(null);
   const [mode, setMode] = useState('login');
   const [form, setForm] = useState({ username: '', password: '', name: '' });
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
+  useEffect(() => { let mounted = true; apiRequest('public_settings').then((result) => { if (mounted) setRegistration(!result.error && result.data?.registration_enabled === true); }); return () => { mounted = false; }; }, []);
   const submit = async (event) => {
     event.preventDefault(); setBusy(true); setError(''); setNotice('');
     try {
@@ -44,10 +46,11 @@ function AuthScreen() {
   };
   return <main className="auth-page">
     <section className="auth-card">
-      <div className="logo-mark">予</div><div className="brand-name">予行 <span>资金申请</span></div>
+      <div className="auth-brand"><Brand /></div>
       <h1>{mode === 'login' ? '欢迎回来' : '创建账号'}</h1>
       <p className="auth-lead">{mode === 'login' ? '登录后查看申请进展。' : '注册后即可提交第一笔申请。'}</p>
-      <div className="tabs"><button className={mode === 'login' ? 'active' : ''} onClick={() => { setMode('login'); setError(''); }}>登录</button><button className={mode === 'signup' ? 'active' : ''} onClick={() => { setMode('signup'); setError(''); }}>注册</button></div>
+      <div className="tabs"><button className={mode === 'login' ? 'active' : ''} onClick={() => { setMode('login'); setError(''); }}>登录</button>{registration === true && <button className={mode === 'signup' ? 'active' : ''} onClick={() => { setMode('signup'); setError(''); }}>注册</button>}</div>
+      {registration === false && <p className="hint">暂不开放注册，请联系管理员创建账号。</p>}
       <form onSubmit={submit} className="stack-form">
         {mode === 'signup' && <label>姓名<input required maxLength="80" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} placeholder="你的姓名" /></label>}
         <label>用户名<input required minLength="3" maxLength="40" pattern="[A-Za-z0-9][A-Za-z0-9_.-]{2,39}" autoComplete="username" value={form.username} onChange={(e) => setForm({ ...form, username: e.target.value })} placeholder="例如：zhangsan" /></label>
@@ -75,7 +78,7 @@ function App() {
     });
     return () => { mounted = false; };
   }, []);
-  if (!supabaseUrl || !supabaseKey) return <main className="auth-page"><section className="auth-card"><div className="logo-mark">予</div><h1>需要连接数据服务</h1><p className="auth-lead">请在部署环境中配置站点数据服务。</p></section></main>;
+  if (!supabaseUrl || !supabaseKey) return <main className="auth-page"><section className="auth-card"><div className="auth-brand"><Brand /></div><h1>连接暂不可用</h1><p className="auth-lead">请稍后重试。</p></section></main>;
   if (session === undefined || (session && !identity && !identityError)) return <main className="loading-page"><Spinner /></main>;
   if (!session) return <AuthScreen />;
   if (identityError) return <main className="auth-page"><section className="auth-card"><h1>账号信息加载失败</h1><ErrorText error={identityError} /><Button onClick={() => window.location.reload()}>重新加载</Button></section></main>;
@@ -91,12 +94,12 @@ function Workspace({ session, identity }) {
   const refresh = () => setRefreshKey((value) => value + 1);
   const logout = async () => { await apiRequest('logout'); localStorage.removeItem(SESSION_KEY); window.location.reload(); };
   return <div className="app-shell">
-    <header className="topbar"><button className="brand-button" onClick={() => open('dashboard')}><span className="logo-mark small">予</span><span className="brand-name">予行 <em>资金申请</em></span></button>
+    <header className="topbar"><button className="brand-button" onClick={() => open('dashboard')}><Brand /></button>
       <nav><button className={view === 'dashboard' ? 'current' : ''} onClick={() => open('dashboard')}>我的申请</button>{roles.length > 0 && <button className={view === 'team' ? 'current' : ''} onClick={() => open('team')}>工作台</button>}{roles.includes('admin') && <button className={view === 'admin' ? 'current' : ''} onClick={() => open('admin')}>设置</button>}</nav>
       <div className="user-menu"><span>{identity.profile?.full_name || session.user.username}</span><button className="logout" onClick={logout}>退出</button></div>
     </header>
     <main className="content">{view === 'dashboard' || view === 'team' ? <Dashboard identity={identity} team={view === 'team'} onOpen={open} refreshKey={refreshKey} /> : view === 'new' ? <ApplicationForm identity={identity} onDone={(id) => { refresh(); open('detail', id); }} onCancel={() => open('dashboard')} /> : view === 'detail' ? <ApplicationDetail id={selectedId} identity={identity} onBack={() => open('dashboard')} onRefresh={refresh} /> : <AdminPanel identity={identity} />}</main>
-    <footer>予行 · 资金申请</footer>
+    <footer>成都七中科学技术协会 财务报销平台</footer>
   </div>;
 }
 
@@ -122,23 +125,6 @@ function Dashboard({ identity, team, onOpen, refreshKey }) {
 }
 
 
-function AdminPanel({ identity }) {
-  const [data, setData] = useState(null); const [threshold, setThreshold] = useState('100'); const [passwords, setPasswords] = useState({ current: '', next: '' }); const [error, setError] = useState(''); const [notice, setNotice] = useState(''); const [busy, setBusy] = useState(false);
-  const load = async () => { const result = await apiRequest('admin_data'); if (result.error) setError(result.error.message); else { setData(result.data); setThreshold(String(result.data.threshold)); } };
-  useEffect(() => { if (identity.roles.includes('admin')) load(); }, []);
-  const roleSet = (userId) => new Set((data?.roles || []).filter((item) => item.user_id === userId).map((item) => item.role));
-  const updateUser = async (userId, nextRoles, active) => { setBusy(true); setError(''); const result = await apiRequest('set_member_roles', { user_id: userId, roles: nextRoles, active }); if (result.error) setError(result.error.message); else await load(); setBusy(false); };
-  const saveRule = async (event) => { event.preventDefault(); setBusy(true); setError(''); const result = await apiRequest('update_threshold', { threshold: Number(threshold) }); if (result.error) setError(result.error.message); else await load(); setBusy(false); };
-  const changePassword = async (event) => { event.preventDefault(); setBusy(true); setError(''); setNotice(''); const result = await apiRequest('change_password', { current_password: passwords.current, new_password: passwords.next }); if (result.error) setError(result.error.message); else { setPasswords({ current: '', next: '' }); setNotice('密码已更新。'); } setBusy(false); };
-  if (!identity.roles.includes('admin')) return <div className="panel-empty"><h2>没有权限</h2></div>;
-  return <><div className="heading-row"><div><p className="eyebrow">组织管理</p><h1>设置</h1></div></div><div className="settings-grid"><section className="panel detail-panel"><h2>审批规则</h2><form onSubmit={saveRule} className="stack-form"><label>主席审批起始金额（元）<input type="number" min="0.01" step="0.01" value={threshold} onChange={(e) => setThreshold(e.target.value)} /></label><p className="hint">达到门槛后，财委通过的申请会进入主席审批。</p><Button disabled={busy}>保存规则</Button></form></section><section className="panel detail-panel"><h2>修改密码</h2><form onSubmit={changePassword} className="stack-form"><label>当前密码<input required type="password" value={passwords.current} onChange={(e) => setPasswords({ ...passwords, current: e.target.value })} /></label><label>新密码<input required minLength="10" type="password" value={passwords.next} onChange={(e) => setPasswords({ ...passwords, next: e.target.value })} /></label><Button disabled={busy}>更新密码</Button>{notice && <div className="notice">{notice}</div>}</form></section><section className="panel detail-panel"><h2>成员与权限</h2>{data?.profiles.map((profile) => { const roles = roleSet(profile.id); return <MemberRow key={profile.id} profile={profile} roles={roles} busy={busy} onSave={updateUser} />; }) || <Spinner />}</section></div><section className="panel detail-panel"><h2>最近操作</h2><div className="table-scroll"><table><thead><tr><th>操作</th><th>详情</th><th>时间</th></tr></thead><tbody>{data?.audit.map((row) => <tr key={row.id}><td>{row.event}</td><td>{row.detail}</td><td className="muted">{dateTime(row.created_at)}</td></tr>)}</tbody></table></div></section><ErrorText error={error} /></>;
-}
-
-function MemberRow({ profile, roles, busy, onSave }) {
-  const [selected, setSelected] = useState(roles); const [active, setActive] = useState(profile.active);
-  useEffect(() => { setSelected(roles); setActive(profile.active); }, [profile.id, profile.active, roles.size]);
-  return <div className="member-row"><div><strong>{profile.full_name || '未命名成员'}</strong><p className="muted">@{profile.username} · {profile.department || '未填写部门'}</p></div><div className="member-roles">{Object.entries(ROLE_LABEL).map(([role, label]) => <label className="check-row" key={role}><input type="checkbox" checked={selected.has(role)} onChange={(e) => { const next = new Set(selected); e.target.checked ? next.add(role) : next.delete(role); setSelected(next); }} />{label}</label>)}<label className="check-row"><input type="checkbox" checked={active} onChange={(e) => setActive(e.target.checked)} />启用</label><Button kind="secondary" disabled={busy} onClick={() => onSave(profile.id, [...selected], active)}>保存</Button></div></div>;
-}
 
 function Root() { return <App />; }
 createRoot(document.getElementById('root')).render(<Root />);
