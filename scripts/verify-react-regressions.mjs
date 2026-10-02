@@ -7,13 +7,14 @@ const { JSDOM } = await import(pathToFileURL(process.env.JSDOM_MODULE).href);
 const bundle = await build({ stdin: { contents: `import React from 'react'; import {createRoot} from 'react-dom/client'; import {ApplicationDetail,ApplicationForm} from './src/workflow.jsx'; import {MemberDirectory} from './src/admin.jsx'; window.testUI={React,createRoot,ApplicationDetail,ApplicationForm,MemberDirectory};`, resolveDir: process.cwd(), loader:'jsx' }, bundle:true, write:false, format:'iife', define:{ 'import.meta.env.VITE_SUPABASE_URL':'"https://fixture.invalid"','import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY':'"fixture"','process.env.NODE_ENV':'"development"' } });
 const dom=new JSDOM('<!doctype html><div id="root"></div>',{url:'https://fixture.invalid',runScripts:'outside-only',pretendToBeVisual:true});
 const w=dom.window; w.IS_REACT_ACT_ENVIRONMENT=true; w.confirm=()=>true; w.TextEncoder=TextEncoder; w.TextDecoder=TextDecoder;
+w.URL.createObjectURL=()=> 'https://fixture.invalid/preview'; w.URL.revokeObjectURL=()=>{};
 w.MessageChannel=class { constructor(){this.port1={onmessage:null};this.port2={postMessage:()=>setImmediate(()=>this.port1.onmessage?.())};} };
 const calls=[]; let fixture;
 const members=Array.from({length:23},(_,i)=>({id:`u${i}`,username:i===0?'admin':`member${i}`,full_name:`成员${i}`,department:i%2?'活动部':'技术部',active:i!==22,roles:i===0?['admin']:i%2?['finance']:[]}));
 w.fetch=async(_url,options)=>{
   const b=options.body instanceof w.FormData?Object.fromEntries(options.body):JSON.parse(options.body);calls.push(b);let data=null,error=null;
   if(b.action==='get_application') data=structuredClone(fixture);
-  if(['create_application','update_application'].includes(b.action)){fixture.application={...fixture.application,...b};data=fixture.application;}
+  if(['create_application','update_application'].includes(b.action)){fixture.application={...fixture.application,...b,...(b.action==='create_application'?{id:`app-${calls.length}`,status:'draft',version:0}:{})};data=fixture.application;}
   if(b.action==='submit_application'){fixture.application.status='finance_pending';fixture.application.version++;}
   if(b.action==='upload_file'){
     fixture.files=fixture.files.filter(f=>!(f.pending&&f.kind===b.kind));const id=`file${calls.length}`;
@@ -36,7 +37,7 @@ const root=createRoot(w.document.querySelector('#root'));const text=()=>w.docume
 const click=async(label)=>{const b=[...w.document.querySelectorAll('button')].find(b=>b.textContent===label);assert.ok(b,`missing ${label}`);await act(()=>b.click());await act(tick);};
 const input=async(selector,value)=>{const el=w.document.querySelector(selector);assert.ok(el,selector);await act(()=>{Object.getOwnPropertyDescriptor(w.HTMLInputElement.prototype,'value').set.call(el,value);el.dispatchEvent(new w.Event('input',{bubbles:true}));});};
 const select=async(selector,value)=>{const el=w.document.querySelector(selector);await act(()=>{el.value=value;el.dispatchEvent(new w.Event('change',{bubbles:true}));});await act(tick);};
-const choose=async(name)=>{const el=w.document.querySelector('input[type=file]');const file=new w.File(['fixture'],name,{type:'application/pdf'});await act(()=>{Object.defineProperty(el,'files',{configurable:true,value:[file]});el.dispatchEvent(new w.Event('change',{bubbles:true}));});};
+const choose=async(name,type='application/pdf')=>{const el=w.document.querySelector('.action-block input[type=file]');const file=new w.File(['fixture'],name,{type});await act(()=>{Object.defineProperty(el,'files',{configurable:true,value:[file]});el.dispatchEvent(new w.Event('change',{bubbles:true}));});};
 const owner={profile:{id:'owner',department:'活动部'},roles:[]};const admin={profile:{id:'manager'},roles:['admin']};
 fixture={application:{id:'fixture-app',owner_id:'owner',title:'回归申请',purpose:'测试',amount:19,category:'物资',department:'活动部',use_date:'2026-10-02',status:'paid',version:1,recipient:'小林'},files:[],actions:[],payment:{amount:19,reference:'PAY-0'},ownerName:'小林'};
 await act(()=>root.render(React.createElement(ApplicationDetail,{id:'fixture-app',identity:admin,onBack:()=>{},onRefresh:()=>{}})));
@@ -46,6 +47,13 @@ for(let i=1;i<=3;i++){
   await click('提交更正');assert.ok(text().includes('付款凭证已更新'));assert.ok(!w.document.querySelector('[role=alert]'));assert.equal(fixture.payment.reference,`PAY-${i}`);assert.equal(w.document.querySelectorAll('.selected-file').length,0);
 }
 console.log('PASS: same-status paid receipt correction submitted three times without stale drafts');
+fixture.application.status='payment_pending';fixture.files=[{id:'old-qr',kind:'qr',name:'old.png',pending:false,storage_path:'old-qr'}];fixture.payment=null;
+await act(()=>root.render(React.createElement(ApplicationDetail,{key:'qr',id:'fixture-app',identity:owner,onBack:()=>{},onRefresh:()=>{}})));
+for(let i=1;i<=3;i++){
+  await choose(`qr${i}.png`,'image/png');await input('.action-block input:not([type])',`收款人${i}`);await click('提交收款信息');
+  assert.ok(text().includes('收款信息已提交'),text());assert.ok(!w.document.querySelector('[role=alert]'));assert.equal(fixture.files.filter(f=>f.kind==='qr').length,1);assert.equal(w.document.querySelectorAll('.selected-file').length,0);
+}
+console.log('PASS: same-status QR replacement submitted three times without stale drafts');
 await act(()=>root.unmount()); const directoryRoot=createRoot(w.document.querySelector('#root'));
 await act(()=>directoryRoot.render(React.createElement(MemberDirectory,{identity:admin,busy:false,revision:1,onSave:()=>{}})));
 await act(tick);
@@ -63,4 +71,12 @@ fixture.application.status='cancelled';
 await act(()=>formRoot.render(React.createElement(ApplicationForm,{identity:owner,initial:fixture.application,onDone:()=>{},onCancel:()=>{}})));
 await click('正式提交');assert.equal(fixture.application.status,'finance_pending');
 console.log('PASS: withdrawn application form resubmits explicitly');
+const seed={title:'新申请',purpose:'测试用途',amount:19,category:'物资',department:'活动部',use_date:'2026-10-02'};
+const created=[];
+for(let i=1;i<=2;i++){
+  await act(()=>formRoot.render(React.createElement(ApplicationForm,{key:`new${i}`,identity:owner,initial:seed,onDone:id=>created.push(id),onCancel:()=>{}})));
+  await click('正式提交');assert.equal(fixture.application.status,'finance_pending');
+}
+assert.equal(created.length,2);assert.notEqual(created[0],created[1]);
+console.log('PASS: two separate application forms each create and formally submit a new application');
 await act(()=>formRoot.unmount());dom.window.close();
