@@ -29,3 +29,10 @@ test('同一状态下再次提交文件不复用已经提交的草稿，处理�
   assert.match(jsx,/await request\('submit_file_draft',[^\n]+setDraft\(null\); setRemoved\(\[\]\); setConfirmed\(false\)/);
   assert.ok(jsx.includes('key={`${id}-${application.status}`}'));
 });
+test('修改密码对所有登录用户可见，不依赖管理员设置', () => {
+  const main=source('src/main.jsx'); const admin=source('src/admin.jsx');
+  assert.match(main,/view === 'account'/);
+  assert.match(main,/>修改密码<\/button>/);
+  assert.match(main,/apiRequest\('change_password'/);
+  assert.doesNotMatch(admin,/<h2>修改密码<\/h2>/);
+});

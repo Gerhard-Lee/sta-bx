@@ -24,6 +24,23 @@ function StatusBadge({ status }) { return <span className={`status ${status}`}>{
 function Button({ children, kind = '', ...props }) { return <button className={`button ${kind}`} {...props}>{children}</button>; }
 function Spinner() { return <span className="spinner" aria-label="加载中" />; }
 
+function AccountPanel() {
+  const [passwords, setPasswords] = useState({ current: '', next: '' });
+  const [busy, setBusy] = useState(false); const [error, setError] = useState(''); const [notice, setNotice] = useState('');
+  const submit = async (event) => {
+    event.preventDefault(); setBusy(true); setError(''); setNotice('');
+    try {
+      const result = await apiRequest('change_password', { current_password: passwords.current, new_password: passwords.next });
+      if (result.error) throw new Error(result.error.message);
+      setPasswords({ current: '', next: '' }); setNotice('密码已更新。');
+    } catch (err) { setError(err.message || '密码没有更新，请重试。'); }
+    finally { setBusy(false); }
+  };
+  return <><div className="heading-row"><div><p className="eyebrow">账户</p><h1>修改密码</h1></div></div>
+    <section className="panel detail-panel account-panel"><p className="muted">更新后，下次登录请使用新密码。</p><form className="stack-form" onSubmit={submit}><fieldset disabled={busy}><label>当前密码<input required type="password" autoComplete="current-password" value={passwords.current} onChange={(e) => setPasswords({ ...passwords, current: e.target.value })} /></label><label>新密码<input required minLength="10" maxLength="72" type="password" autoComplete="new-password" value={passwords.next} onChange={(e) => setPasswords({ ...passwords, next: e.target.value })} /></label><ErrorText error={error} />{notice && <div className="notice" role="status">{notice}</div>}<Button kind="secondary">更新密码</Button></fieldset></form></section>
+  </>;
+}
+
 
 function AuthScreen() {
   const [registration, setRegistration] = useState(null);
@@ -95,10 +112,10 @@ function Workspace({ session, identity }) {
   const logout = async () => { await apiRequest('logout'); localStorage.removeItem(SESSION_KEY); window.location.reload(); };
   return <div className="app-shell">
     <header className="topbar"><button className="brand-button" onClick={() => open('dashboard')}><Brand /></button>
-      <nav><button className={view === 'dashboard' ? 'current' : ''} onClick={() => open('dashboard')}>我的申请</button>{roles.length > 0 && <button className={view === 'team' ? 'current' : ''} onClick={() => open('team')}>工作台</button>}{roles.includes('admin') && <button className={view === 'admin' ? 'current' : ''} onClick={() => open('admin')}>设置</button>}</nav>
+      <nav><button className={view === 'dashboard' ? 'current' : ''} onClick={() => open('dashboard')}>我的申请</button>{roles.length > 0 && <button className={view === 'team' ? 'current' : ''} onClick={() => open('team')}>工作台</button>}{roles.includes('admin') && <button className={view === 'admin' ? 'current' : ''} onClick={() => open('admin')}>设置</button>}<button className={view === 'account' ? 'current' : ''} onClick={() => open('account')}>修改密码</button></nav>
       <div className="user-menu"><span>{identity.profile?.full_name || session.user.username}</span><button className="logout" onClick={logout}>退出</button></div>
     </header>
-    <main className="content">{view === 'dashboard' || view === 'team' ? <Dashboard identity={identity} team={view === 'team'} onOpen={open} refreshKey={refreshKey} /> : view === 'new' ? <ApplicationForm identity={identity} onDone={(id) => { refresh(); open('detail', id); }} onCancel={() => open('dashboard')} /> : view === 'detail' ? <ApplicationDetail id={selectedId} identity={identity} onBack={() => open('dashboard')} onRefresh={refresh} /> : <AdminPanel identity={identity} />}</main>
+    <main className="content">{view === 'dashboard' || view === 'team' ? <Dashboard identity={identity} team={view === 'team'} onOpen={open} refreshKey={refreshKey} /> : view === 'new' ? <ApplicationForm identity={identity} onDone={(id) => { refresh(); open('detail', id); }} onCancel={() => open('dashboard')} /> : view === 'detail' ? <ApplicationDetail id={selectedId} identity={identity} onBack={() => open('dashboard')} onRefresh={refresh} /> : view === 'account' ? <AccountPanel /> : <AdminPanel identity={identity} />}</main>
     <footer>成都七中科学技术协会 财务报销平台 · 本网站由 网络部 搭建运营 · 版本号 1.0.0</footer>
   </div>;
 }
