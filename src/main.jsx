@@ -99,7 +99,7 @@ function Workspace({ session, identity }) {
       <div className="user-menu"><span>{identity.profile?.full_name || session.user.username}</span><button className="logout" onClick={logout}>退出</button></div>
     </header>
     <main className="content">{view === 'dashboard' || view === 'team' ? <Dashboard identity={identity} team={view === 'team'} onOpen={open} refreshKey={refreshKey} /> : view === 'new' ? <ApplicationForm identity={identity} onDone={(id) => { refresh(); open('detail', id); }} onCancel={() => open('dashboard')} /> : view === 'detail' ? <ApplicationDetail id={selectedId} identity={identity} onBack={() => open('dashboard')} onRefresh={refresh} /> : <AdminPanel identity={identity} />}</main>
-    <footer>成都七中科学技术协会 财务报销平台</footer>
+    <footer>成都七中科学技术协会 财务报销平台 · 本网站由 网络部 搭建运营 · 版本号 1.0.0</footer>
   </div>;
 }
 
