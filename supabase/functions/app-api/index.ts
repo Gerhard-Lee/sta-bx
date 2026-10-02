@@ -94,8 +94,12 @@ async function actorFromRequest(req: Request, admin: AdminClient) {
   return { token, user, roles: (roleRows ?? []).map((row) => row.role as string) }
 }
 
+function isSuperAdmin(actor: Awaited<ReturnType<typeof actorFromRequest>>) {
+  return actor.roles.includes('admin') && actor.user.username.toLowerCase() === 'admin'
+}
+
 function hasRole(actor: Awaited<ReturnType<typeof actorFromRequest>>, role: string) {
-  return actor.roles.includes(role) || actor.roles.includes('admin')
+  return actor.roles.includes(role) || (role !== 'admin' && isSuperAdmin(actor))
 }
 
 function requireRole(actor: Awaited<ReturnType<typeof actorFromRequest>>, role: string) {

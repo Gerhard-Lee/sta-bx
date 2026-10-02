@@ -5,6 +5,8 @@ begin
   perform set_config('request.headers','{"x-audit-ip":"203.0.113.10","x-audit-ip-source":"x-forwarded-for","x-audit-action":"test","x-audit-request-id":"00000000-0000-4000-8000-000000000001"}',true);
   r := private.app_insert_user('verify_admin_'||substr(gen_random_uuid()::text,1,8),'Test-only-1369666','测试管理员','测试'); a := (r->>'id')::uuid;
   insert into public.user_roles(user_id,role) values(a,'admin');
+  -- An admin only becomes a reviewer when the workflow identity is explicit.
+  insert into public.user_roles(user_id,role) values(a,'finance');
   r := private.app_insert_user('verify_user_'||substr(gen_random_uuid()::text,1,8),'Test-only-1369666','测试成员','测试'); ordinary := (r->>'id')::uuid;
   perform public.app_update_registration(a,false);
   begin perform public.app_create_user('verify_closed_user','Test-only-1369666','测试',''); raise exception 'registration unexpectedly allowed'; exception when raise_exception then if SQLERRM='registration unexpectedly allowed' then raise; end if; end;

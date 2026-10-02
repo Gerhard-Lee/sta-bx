@@ -3,7 +3,9 @@ export const STATUS = {
   changes_requested: '退回修改', rejected: '已拒绝', payment_info_required: '待补充收款码',
   payment_pending: '待付款', paid: '已付款', cancelled: '已撤回'
 };
-export const hasRole = (identity, role) => identity.roles.includes(role) || identity.roles.includes('admin');
+// 管理员本身不是财委、主席或付款登记身份；只有内置 admin 超级管理员可以跨身份操作。
+export const isSuperAdmin = (identity) => identity?.roles?.includes('admin') === true && identity?.profile?.username?.toLowerCase() === 'admin';
+export const hasRole = (identity, role) => identity?.roles?.includes(role) === true || (role !== 'admin' && isSuperAdmin(identity));
 export const isEditable = (application, identity) => application.owner_id === identity.profile.id && ['draft', 'changes_requested', 'cancelled'].includes(application.status);
 export const canEditAttachments = (application, identity) => application.owner_id === identity.profile.id && ['draft', 'changes_requested', 'cancelled', 'finance_pending', 'chair_pending', 'payment_info_required', 'payment_pending'].includes(application.status);
 export const canEditPaymentInfo = (application, identity) => application.owner_id === identity.profile.id && ['payment_info_required', 'payment_pending'].includes(application.status);

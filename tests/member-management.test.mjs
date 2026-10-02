@@ -36,3 +36,14 @@ test('修改密码对所有登录用户可见，不依赖管理员设置', () =>
   assert.match(main,/apiRequest\('change_password'/);
   assert.doesNotMatch(admin,/<h2>修改密码<\/h2>/);
 });
+
+test('管理员权限不替代财委、主席身份，只有内置 admin 可以跨身份', () => {
+  const rules = source('src/workflow-rules.js');
+  assert.match(rules, /isSuperAdmin/);
+  assert.match(rules, /role !== 'admin' && isSuperAdmin/);
+  const api = source('supabase/functions/app-api/index.ts');
+  assert.match(api, /role !== 'admin' && isSuperAdmin/);
+  const migration = source('supabase/migrations/20261002133000_separate_admin_and_workflow_roles.sql');
+  assert.match(migration, /create or replace function private\.app_user_is_superadmin/);
+  assert.match(migration, /p_role in \('finance', 'chair', 'cashier'\)/);
+});

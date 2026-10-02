@@ -5,6 +5,7 @@ begin
   select id into super_id from public.app_users where username='admin';
   r:=private.app_insert_user('verify_manager_'||substr(gen_random_uuid()::text,1,8),'Test-only-1369666','测试管理员','测试'); other_admin:=(r->>'id')::uuid;
   insert into public.user_roles(user_id,role) values(other_admin,'admin');
+  insert into public.user_roles(user_id,role) values(other_admin,'finance');
   r:=private.app_insert_user('verify_member_'||substr(gen_random_uuid()::text,1,8),'Test-only-1369666','测试成员','测试'); ordinary:=(r->>'id')::uuid;
   foreach u in array array[super_id,other_admin,ordinary] loop
     denied:=false;
