@@ -15,7 +15,7 @@ begin
   if not private.app_user_active(p_actor_id) then raise exception '账号已停用'; end if;
   select * into a from public.applications where id = p_application_id for update;
   if a.id is null or p_kind not in ('attachment','qr','receipt') then raise exception '文件类型或申请无效'; end if;
-  if p_kind = 'attachment' and (a.owner_id <> p_actor_id or a.status not in ('draft','changes_requested','finance_pending','chair_pending','payment_info_required','payment_pending')) then raise exception '当前不能修改申请附件'; end if;
+  if p_kind = 'attachment' and (a.owner_id <> p_actor_id or a.status not in ('draft','changes_requested','cancelled','finance_pending','chair_pending','payment_info_required','payment_pending')) then raise exception '当前不能修改申请附件'; end if;
   if p_kind = 'qr' and (a.owner_id <> p_actor_id or a.status not in ('payment_info_required','payment_pending')) then raise exception '当前不能保存收款信息'; end if;
   if p_kind = 'receipt' and (a.owner_id = p_actor_id or not private.app_user_has_role(p_actor_id,'cashier') or a.status not in ('payment_pending','paid')) then raise exception '当前不能保存付款凭证'; end if;
   if p_storage_path not like a.owner_id::text || '/' || a.id::text || '/%' then raise exception '文件路径无效'; end if;
@@ -56,7 +56,7 @@ begin
   select * into a from public.applications where id = p_application_id for update;
   select * into f from public.application_files where id = p_file_id and application_id = a.id and removed_at is null;
   if f.id is null then raise exception '文件不存在或已移除'; end if;
-  if f.kind = 'attachment' and (a.owner_id <> p_actor_id or a.status not in ('draft','changes_requested','finance_pending','chair_pending','payment_info_required','payment_pending')) then raise exception '当前不能移除附件'; end if;
+  if f.kind = 'attachment' and (a.owner_id <> p_actor_id or a.status not in ('draft','changes_requested','cancelled','finance_pending','chair_pending','payment_info_required','payment_pending')) then raise exception '当前不能移除附件'; end if;
   if f.kind = 'qr' and (a.owner_id <> p_actor_id or a.status not in ('payment_info_required','payment_pending')) then raise exception '当前不能移除收款码'; end if;
   if f.kind = 'receipt' and (not f.pending or a.owner_id = p_actor_id or not private.app_user_has_role(p_actor_id,'cashier') or a.status not in ('payment_pending','paid')) then raise exception '已提交的付款凭证请用新凭证替换'; end if;
   update public.application_files set removed_at = now() where id = f.id;

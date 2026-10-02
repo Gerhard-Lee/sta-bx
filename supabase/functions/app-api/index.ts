@@ -221,7 +221,7 @@ async function handle(req: Request) {
       use_date: requiredString(body.use_date, '请选择使用日期。'),
     }
     if (!Number.isFinite(payload.amount) || payload.amount <= 0 || payload.amount > 10000000) throw new HttpError('请输入有效金额。')
-    const { data, error } = await admin.from('applications').update(payload).eq('id', id).eq('owner_id', actor.user.id).in('status', ['draft', 'changes_requested']).select().single()
+    const { data, error } = await admin.from('applications').update(payload).eq('id', id).eq('owner_id', actor.user.id).in('status', ['draft', 'changes_requested', 'cancelled']).select().single()
     if (error) throw new Error(error.message)
     return ok(data)
   }
@@ -278,7 +278,7 @@ async function handle(req: Request) {
     if (!['image/png', 'image/jpeg', 'application/pdf'].includes(file.type) || (kind === 'qr' && file.type === 'application/pdf')) throw new HttpError('请选择 PNG、JPG 图片或 PDF 文件。')
     const { data: application, error: applicationError } = await admin.from('applications').select('id,owner_id,status').eq('id', applicationId).maybeSingle()
     if (applicationError || !application) throw new HttpError('申请不存在。', 404)
-    if (kind === 'attachment' && (application.owner_id !== actor.user.id || !['draft','changes_requested','finance_pending','chair_pending','payment_info_required','payment_pending'].includes(application.status))) throw new HttpError('当前不能修改申请附件。', 403)
+    if (kind === 'attachment' && (application.owner_id !== actor.user.id || !['draft','changes_requested','cancelled','finance_pending','chair_pending','payment_info_required','payment_pending'].includes(application.status))) throw new HttpError('当前不能修改申请附件。', 403)
     if (kind === 'qr' && (application.owner_id !== actor.user.id || !['payment_info_required','payment_pending'].includes(application.status))) throw new HttpError('当前不能修改收款信息。', 403)
     if (kind === 'receipt' && (application.owner_id === actor.user.id || !hasRole(actor, 'cashier') || !['payment_pending','paid'].includes(application.status))) throw new HttpError('没有付款登记权限。', 403)
     const safeName = file.name.replace(/[^a-zA-Z0-9._-]/g, '_').slice(-120) || 'file'
@@ -312,16 +312,26 @@ async function handle(req: Request) {
 
   if (action === 'admin_data') {
     requireRole(actor, 'admin')
-    const [usersResult, rolesResult, settingResult, auditResult] = await Promise.all([
-      admin.from('app_users').select('id,username,full_name,department,active').order('full_name'),
-      admin.from('user_roles').select('user_id,role'),
+    const [settingResult, auditResult] = await Promise.all([
       admin.from('settings').select('threshold,registration_enabled').eq('id', 1).single(),
       admin.from('audit_logs').select('*').order('created_at', { ascending: false }).order('id', { ascending: false }).limit(50),
     ])
-    if (usersResult.error || rolesResult.error || settingResult.error || auditResult.error) throw new Error('管理数据读取失败。')
+    if (settingResult.error || auditResult.error) throw new Error('管理数据读取失败。')
+    const missingNames = [...new Set((auditResult.data ?? []).filter((row) => !row.username && row.actor_id).map((row) => row.actor_id))]
+    const usersResult = missingNames.length ? await admin.from('app_users').select('id,username').in('id', missingNames) : { data: [], error: null }
+    if (usersResult.error) throw new Error('用户信息读取失败。')
     const names = new Map((usersResult.data ?? []).map((u) => [u.id, u.username]))
     const logs = (auditResult.data ?? []).map((row) => ({ ...row, username: row.username || names.get(row.actor_id) || '系统' }))
-    return ok({ profiles: usersResult.data ?? [], roles: rolesResult.data ?? [], threshold: settingResult.data.threshold, registration_enabled: settingResult.data.registration_enabled, audit: logs })
+    return ok({ threshold: settingResult.data.threshold, registration_enabled: settingResult.data.registration_enabled, audit: logs })
+  }
+
+  if (action === 'admin_members') {
+    requireRole(actor, 'admin')
+    return ok(await rpc('app_list_members', {
+      p_actor_id: actor.user.id, p_query: String(body.query ?? '').trim(),
+      p_role: String(body.role ?? ''), p_active: String(body.active ?? ''),
+      p_page: Number(body.page ?? 1), p_page_size: Number(body.page_size ?? 10),
+    }))
   }
 
   if (action === 'update_registration') {

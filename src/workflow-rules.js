@@ -4,8 +4,8 @@ export const STATUS = {
   payment_pending: '待付款', paid: '已付款', cancelled: '已撤回'
 };
 export const hasRole = (identity, role) => identity.roles.includes(role) || identity.roles.includes('admin');
-export const isEditable = (application, identity) => application.owner_id === identity.profile.id && ['draft', 'changes_requested'].includes(application.status);
-export const canEditAttachments = (application, identity) => application.owner_id === identity.profile.id && ['draft', 'changes_requested', 'finance_pending', 'chair_pending', 'payment_info_required', 'payment_pending'].includes(application.status);
+export const isEditable = (application, identity) => application.owner_id === identity.profile.id && ['draft', 'changes_requested', 'cancelled'].includes(application.status);
+export const canEditAttachments = (application, identity) => application.owner_id === identity.profile.id && ['draft', 'changes_requested', 'cancelled', 'finance_pending', 'chair_pending', 'payment_info_required', 'payment_pending'].includes(application.status);
 export const canEditPaymentInfo = (application, identity) => application.owner_id === identity.profile.id && ['payment_info_required', 'payment_pending'].includes(application.status);
 export const canRecordPayment = (application, identity) => application.owner_id !== identity.profile.id && hasRole(identity, 'cashier') && ['payment_pending', 'paid'].includes(application.status);
 export function validateFile(file, kind = 'attachment') {

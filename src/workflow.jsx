@@ -123,7 +123,7 @@ function StepEditor({ application, kind, draft: initialDraft, committedFiles = [
         const file = files[0]; const result = await upload({ application_id: application.id, kind, value, file });
         saved = { id: result.file_id, storage_path: result.path, kind, pending: true, name: file.name, draft_value: value }; setDraft(saved); setFiles([]);
       } else if (saved) await request('save_file_draft', { application_id: application.id, file_id: saved.id, value });
-      if (submit) { await request('submit_file_draft', { application_id: application.id, file_id: saved.id, value, confirmed }); setConfirmed(false); }
+      if (submit) { await request('submit_file_draft', { application_id: application.id, file_id: saved.id, value, confirmed }); setDraft(null); setRemoved([]); setConfirmed(false); }
       await onSaved(submit ? kind === 'qr' ? '收款信息已提交。' : application.status === 'paid' ? '付款凭证已更新。' : '付款已登记。' : saved ? '已保存，尚未提交。' : '草稿文件已移除。');
     } catch (err) { setError(err.message); await onSaved(''); }
     finally { lock.current = false; setBusy(false); }
@@ -165,9 +165,9 @@ export function ApplicationDetail({ id, identity, onBack, onRefresh }) {
   </div></div><Notice>{notice}</Notice><ErrorText error={error} /><div className="detail-grid"><section className="panel detail-panel"><div className="amount-label">申请金额</div><div className="hero-amount">{money(application.amount)}</div><dl><dt>申请人</dt><dd>{ownerName}</dd><dt>部门 / 活动</dt><dd>{application.department}</dd><dt>费用类别</dt><dd>{application.category}</dd><dt>使用日期</dt><dd>{dateText(application.use_date)}</dd></dl><h3>用途说明</h3><p className="prose">{application.purpose}</p><h3>申请附件</h3>
     {canEditAttachments(application, identity) && !editable ? <AttachmentEditor application={application} initialFiles={attachments} onSaved={onSaved} /> : <>{attachments.length ? attachments.map((file) => <FileLink key={file.id} file={file} />) : <p className="muted">暂无附件</p>}{editable && <Button kind="secondary" onClick={() => setEditing(true)}>编辑附件</Button>}</>}
     {committed.length > 0 && <><h3>收款与付款文件</h3>{committed.map((file) => <FileLink key={file.id} file={file} />)}</>}
-    {canEditPaymentInfo(application, identity) && <StepEditor key={`qr-${application.status}`} application={application} kind="qr" draft={files.find((file) => file.kind === 'qr' && file.pending)} committedFiles={committed.filter((file) => file.kind === 'qr')} payment={payment} onSaved={onSaved} />}
-    {canRecordPayment(application, identity) && <StepEditor key={`receipt-${application.status}`} application={application} kind="receipt" draft={files.find((file) => file.kind === 'receipt' && file.pending)} payment={payment} onSaved={onSaved} />}
-    {canReview && <ReviewEditor id={id} onSaved={onSaved} />}
+    {canEditPaymentInfo(application, identity) && <StepEditor key={`${id}-qr-${application.status}`} application={application} kind="qr" draft={files.find((file) => file.kind === 'qr' && file.pending)} committedFiles={committed.filter((file) => file.kind === 'qr')} payment={payment} onSaved={onSaved} />}
+    {canRecordPayment(application, identity) && <StepEditor key={`${id}-receipt-${application.status}`} application={application} kind="receipt" draft={files.find((file) => file.kind === 'receipt' && file.pending)} payment={payment} onSaved={onSaved} />}
+    {canReview && <ReviewEditor key={`${id}-${application.status}`} id={id} onSaved={onSaved} />}
     {payment && <div className="payment-record"><h3>付款记录</h3><p>{money(payment.amount)} · {payment.reference}</p></div>}
   </section><aside className="panel timeline"><h2>进展</h2>{actions.length ? <ol>{actions.map((action) => <li key={action.id}><strong>{action.action}</strong><p>{action.note || '—'}</p><time>{dateTime(action.created_at)}</time></li>)}</ol> : <p className="muted">草稿已保存</p>}</aside></div></>;
 }
