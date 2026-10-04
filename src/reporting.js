@@ -5,6 +5,15 @@ export function formatDateTime(value) {
   const parts = new Intl.DateTimeFormat('sv-SE', { timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23' }).format(new Date(value));
   return parts;
 }
+/** One human-readable line for the same filter object the server applies to list and export. */
+export function auditFilterSummary(filters = {}) {
+  const parts = [];
+  if (filters.username) parts.push(`用户名 含「${filters.username}」`);
+  if (filters.event) parts.push(`操作 含「${filters.event}」`);
+  if (filters.ip) parts.push(`IP 含「${filters.ip}」`);
+  if (filters.start || filters.end) parts.push(`${filters.start || '最早'} 至 ${filters.end || '现在'}`);
+  return parts.join(' · ');
+}
 export function auditDetail(row) {
   const changes = row.metadata?.changes;
   const details = Object.entries(changes || {}).map(([field, value]) => {
@@ -96,7 +105,12 @@ export function fillExportTemplate(templateBytes, kind, data, openingBalance = '
     const pattern = new RegExp(`<c\\b(?=[^>]*\\br="${address}")[^>]*(?:\\/>|>[\\s\\S]*?<\\/c>)`);
     header = header.replace(pattern, (old) => cell(address, value, old.match(/s="(\d+)"/)?.[1]));
   };
-  replaceCell('A2', `${data.start || '全部日期'} 至 ${data.end || '现在'} · 导出时间 ${formatDateTime(data.generated_at)}`);
+  // For the audit log the date range belongs to the shared filter object, so the
+  // export header states that range once instead of once per source.
+  const start = data.filters ? data.filters.start || '' : data.start;
+  const end = data.filters ? data.filters.end || '' : data.end;
+  const auditScope = data.filters ? auditFilterSummary({ ...data.filters, start: '', end: '' }) : '';
+  replaceCell('A2', `${start || '全部日期'} 至 ${end || '现在'}${auditScope ? ` · ${auditScope}` : ''} · 导出时间 ${formatDateTime(data.generated_at)}`);
   const financial = kind === 'financial' ? financialRows(data, openingBalance) : null;
   replaceCell('A3', financial ? financial.known ? '单位：元。仅含已付款报销；余额按输入期初余额减本期报销支出计算，不含其他收支。' : '单位：元。仅含已付款报销；未记录收入及期初余额，收入和余额留空。' : 'IP 来自请求代理信息；历史记录没有采集的 IP 显示为未记录。');
   const entries = financial ? financial.rows : data.rows.map((r) => ({ values: [excelTime(r.created_at), r.username || '系统', r.ip_address || '未记录', r.event, auditDetail(r), String(r.id)] }));
