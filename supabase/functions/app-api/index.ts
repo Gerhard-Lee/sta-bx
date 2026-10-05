@@ -99,7 +99,8 @@ function isSuperAdmin(actor: Awaited<ReturnType<typeof actorFromRequest>>) {
 }
 
 function hasRole(actor: Awaited<ReturnType<typeof actorFromRequest>>, role: string) {
-  return actor.roles.includes(role) || (role !== 'admin' && isSuperAdmin(actor))
+  // 付款登记（cashier）视同财委（finance），与 private.app_user_has_role 保持一致。
+  return actor.roles.includes(role) || (role !== 'admin' && isSuperAdmin(actor)) || (role === 'cashier' && actor.roles.includes('finance'))
 }
 
 function requireRole(actor: Awaited<ReturnType<typeof actorFromRequest>>, role: string) {
