@@ -64,39 +64,37 @@ const MIGRATION_FILES = (() => {
   return names.map((name) => path.join(directory, name));
 })();
 
-// docs/database-migrations.md / README「执行顺序」把四份散装 SQL 排在最前，因为真实的 Supabase 项目上它们是
-// 早期在 Dashboard 的 SQL 编辑器里手工执行过的，那时 20260929130000_funds.sql 早已按账本应用过。PGlite 是空库，
-// 这里只是把同一个依赖链按真实的可执行顺序摆出来，没有改写任何仓库 SQL：
-//   1) 基线迁移 20260929130000_funds.sql（建 profiles/user_roles/settings/applications/... 与 storage bucket）
-//      与 20260929180000_custom_app_users.sql（建 app_users/app_sessions）——散装 SQL 全是对既有表的 alter。
-//   2) 四份散装 SQL（private.app_insert_user、public.app_list_members、显式提交等）。
-//   3) 时间戳更大的迁移：20261004210000_email_notify.sql 开头的 fail-fast 明确要求散装 SQL 先执行。
-// 顺序错了会直接报"缺少 private.app_insert_user"——这正是本条用例要真实覆盖的那道 fail-fast。
+// docs/database-migrations.md / README「执行顺序」的 4 份散装 SQL：早期在 Supabase Dashboard 的 SQL 编辑器里
+// 手工执行过、后来才补 verify 的历史遗留。它们全是 alter table / 建函数，针对的都是**已经存在**的表。
 const BULK_FILES = [
   path.join(SQL_ROOT, 'admin-settings-audit.sql'),
   path.join(SQL_ROOT, 'member-management-and-resubmission.sql'),
   path.join(SQL_ROOT, 'detailed-file-and-review-audit.sql'),
   path.join(SQL_ROOT, 'explicit-submission.sql'),
 ];
-// 散装 SQL 依赖的基线段：建出它们要修改的表。20261002133000 与 20261005010000 只重定义 private.app_user_has_role，
-// 放在散装 SQL 之前更贴近"库里本来就有完整账本"的真实状态。
+
+// PGlite 是空库，而文档里的顺序假设"业务表早就存在"，照字面执行第一条 alter 就会报
+// `relation "public.settings" does not exist`。所以这里把真实依赖链摆成可执行顺序（没有改写任何仓库 SQL）：
+//   1) 基线段迁移：20260929130000_funds.sql 建 profiles/user_roles/settings/applications/... 与 storage bucket；
+//      20260929180000_custom_app_users.sql 建 app_users/app_sessions。散装 SQL 改的就是这些表。
+//      20261002133000 与 20261005010000 只重定义 private.app_user_has_role，放这里更贴近"库里本来就有完整账本"。
+//   2) 4 份散装 SQL（private.app_insert_user、public.app_list_members、显式提交等）。
+//   3) 其余迁移：20261004210000_email_notify.sql 开头的 fail-fast 明确要求散装 SQL 先执行，顺序错了会直接报
+//      "缺少 private.app_insert_user"——这正是第一条用例要真实覆盖的那道 fail-fast。
 const BASELINE_MIGRATIONS = MIGRATION_FILES.filter((file) => {
   const name = path.basename(file);
   return /^(20260929130000|20260929130500|20260929180000|20260929181000|20260929190000|20261002133000|20261005010000)_/.test(name);
 });
-// 执行顺序：基线段 → 四份散装 SQL → 内置 admin → 其余迁移 → 全部 verify（每个文件只执行一次）。
-// 其余迁移（含 20261004210000_email_notify.sql）必须排在散装 SQL 之后：它的开头有一道 fail-fast，
-// 缺 private.app_insert_user 会直接报"请先执行 supabase/admin-settings-audit.sql"。
 const LATE_MIGRATIONS = MIGRATION_FILES.filter((file) => !BASELINE_MIGRATIONS.includes(file));
+
 // 散装 SQL 的 verify 脚本（admin-settings-audit.verify.sql、member-management-and-resubmission.verify.sql、
 // 20261002133000_*.verify.sql、20261005010000_*.verify.sql、explicit-submission.verify.sql）都以
 // "内置 admin 账号存在" 为前置条件（"built-in admin is required"），但它们只按角色去取这个账号，不负责创建。
-// 空库上没有它，这些 verify 必然报错（典型现象：member-management 的 "admin role deletion allowed"——
-// super_id 取不到，删角色自然不会触发守卫）。所以这里按仓库注释里写的部署动作补出这个账号：
-// 先用基线段已有的 app_users 表建号（private.app_insert_user），再补上 admin 角色。
+// 空库上没有它，这些 verify 必然报错（典型现象是 member-management 的 "admin role deletion allowed"：
+// super_id 取不到，删角色自然不会触发守卫）。所以这里按仓库自己的写法补出这个账号：先建号再补 admin 角色。
 // 位置是唯一的可插入点：member-management-and-resubmission.sql 会装上 private.protect_builtin_admin 触发器，
 // 之后任何给 admin 账号补角色的语句都会被它按"admin 的权限已锁定，任何用户都不能修改"拒掉；
-// 而 private.app_insert_user 又只在 admin-settings-audit.sql 里定义，所以只能排在两者之间。
+// 而 private.app_insert_user 又只在 admin-settings-audit.sql 里定义，所以只能夹在两者之间。
 // 建号后把注册开关关回去，保持与生产默认值（关闭注册）一致。
 const ADMIN_FIXTURE = `
 do $$
@@ -110,12 +108,15 @@ begin
   update public.settings set registration_enabled = false where id = 1;
 end $$;
 `;
-// 每个结构文件之后执行同名 .verify.sql；verify 脚本自己包在 begin; … rollback; 里，这里统一在结构加载完、
-// 内置 admin 建好之后跑。
+
+// 每个非 verify 文件之后执行同名 .verify.sql（verify 自己包在 begin; … rollback; 里，不留下验证数据）。
+// 这里统一在结构加载完、内置 admin 建好之后跑——散装 SQL 的 verify 会用其余迁移建出的工作流函数。
 const VERIFY_FILES = [
   ...BULK_FILES.map((file) => file.replace(/\.sql$/, '.verify.sql')),
   ...MIGRATION_FILES.map((file) => file.replace(/\.sql$/, '.verify.sql')),
 ].filter(existsSync);
+
+// 最终执行顺序：基线段 → 4 份散装 SQL → 内置 admin → 其余迁移 → 全部 verify（每个文件只执行一次）。
 const EXECUTION_ORDER = [...BASELINE_MIGRATIONS, ...BULK_FILES, ...LATE_MIGRATIONS, ...VERIFY_FILES];
 
 function failure(file, error) {
