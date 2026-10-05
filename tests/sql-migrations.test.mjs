@@ -217,7 +217,7 @@ test('真实 PostgreSQL 能按文档顺序跑完整套 SQL 栈（4 份散装 SQL
     'email_notify 迁移必须排在散装 SQL 之后，否则它的 fail-fast 会直接报"缺少 private.app_insert_user"',
   );
   assert.ok(migrationNames.length >= 9, `迁移文件数异常：${migrationNames.length}`);
-  assert.equal(bulkNames.length, 4, 'docs 列出的四份散装 SQL 都应执行');
+  assert.equal(bulkNames.length, 4, '仓库里的四份散装 SQL 都应执行');
   // 有同名 .verify.sql 的文件，它的 verify 必须被执行到；反之 verify 清单里不能出现孤儿。
   // 早期迁移（20260929*）本来就没有 verify，所以这里只校验"存在就必须跑"，不要求每个文件都有。
   for (const structure of [...migrationNames, ...bulkNames]) {

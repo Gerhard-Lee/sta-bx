@@ -18,7 +18,7 @@ globalThis.__auditClient = () => ({
       : table === 'user_roles' ? actorRoles.map(role => ({role}))
       : table === 'settings' ? { threshold: 100, registration_enabled: true } : null;
     const query = { then(resolve, reject) { return Promise.resolve({data, error:null}).then(resolve, reject); } };
-    for (const method of ['select', 'eq', 'maybeSingle', 'single', 'update', 'insert', 'delete', 'order', 'range']) query[method] = () => query;
+    for (const method of ['select', 'eq', 'maybeSingle', 'single', 'update', 'insert', 'delete', 'order', 'range', 'limit']) query[method] = () => query;
     return query;
   },
   async rpc(name, args) { rpcCalls.push({name, args}); return rpcResult(name, args); },

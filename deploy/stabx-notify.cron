@@ -1,4 +1,0 @@
-# 放到 /etc/cron.d/stabx-notify 并 chmod 644（脚本本身 chmod 755）。
-# 每 5 分钟消费一次邮件队列；日志留在 /var/log/stabx-notify.log，失败时非 0 退出会打印在日志里。
-# 不需要 pg_cron，也不需要 pg_net：这条主机 cron 就是 20261005140000_email_notify_cron.sql 打印“跳过”后的替代方案。
-*/5 * * * * root STABX_NOTIFY_ENV=/etc/stabx-notify.env /opt/stabx/deploy/drain.sh >> /var/log/stabx-notify.log 2>&1

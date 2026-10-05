@@ -2,13 +2,9 @@ import { createClient } from 'npm:@supabase/supabase-js@2'
 
 const supabaseUrl = Deno.env.get('SUPABASE_URL') ?? ''
 const secretKeys = Deno.env.get('SUPABASE_SECRET_KEYS')
-// 自托管的 compose 会注入 {"default":""} 这样的空值：取不到密钥时必须回落到 SERVICE_ROLE_KEY，
-// 否则拿着空字符串去请求 PostgREST，会在每个接口上返回难以定位的 401。
-const secretKey = (secretKeys ? String(JSON.parse(secretKeys).default ?? '') : '') || (Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? '')
-const publicBaseUrl = (Deno.env.get('SUPABASE_PUBLIC_URL') ?? '').trim().replace(/\/$/, '')
-// 自托管时容器内的 SUPABASE_URL 是内网地址（官方 compose 固定为 http://api-gw:8000），
-// 签名文件地址要换成浏览器可达的公网地址；云端部署没有这个变量时保持原样。
-const toPublicUrl = (value: string) => (publicBaseUrl && supabaseUrl && value.startsWith(supabaseUrl) ? publicBaseUrl + value.slice(supabaseUrl.length) : value)
+const secretKey = secretKeys
+  ? JSON.parse(secretKeys).default
+  : (Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? '')
 function createAdmin(req: Request, requestId: string, action = '', actorId = '') {
   const source = ['cf-connecting-ip', 'x-real-ip', 'x-forwarded-for'].find((key) => req.headers.get(key))
   const address = source ? req.headers.get(source)?.split(',')[0].trim() ?? '' : ''
@@ -697,7 +693,7 @@ async function handle(req: Request) {
     if (file.pending && !((file.kind === 'qr' && file.owner_id === actor.user.id) || (file.kind === 'receipt' && file.owner_id !== actor.user.id && hasRole(actor, 'cashier')))) throw new HttpError('没有草稿文件查看权限。', 403)
     const { data, error } = await admin.storage.from(bucket).createSignedUrl(path, 300)
     if (error) throw new Error(error.message)
-    return ok({ signedUrl: toPublicUrl(data.signedUrl) })
+    return ok({ signedUrl: data.signedUrl })
   }
 
   if (action === 'admin_data') {
@@ -713,10 +709,11 @@ async function handle(req: Request) {
       admin.from('notifications').select('*', { count: 'exact', head: true }).eq('status', 'cancelled'),
     ])
     // 队列统计同样是管理面板的一部分：任何一个查询失败都要报错，不能静默显示 0 封。
+    // auditResult 来自 rpc()：失败时 helper 直接抛 HttpError，恒无 .error；保留在条件里只为让"任一项失败即整体报错"一眼可读。
     if (settingResult.error || auditResult.error || pendingResult.error || sendingResult.error || sentResult.error || failedResult.error || cancelledResult.error) throw new Error('管理数据读取失败。')
     const failuresResult = await admin.from('notifications')
       .select('id,event,application_id,recipient_user_id,attempts,last_error,created_at')
-      .eq('status', 'failed').order('id', { ascending: false }).range(0, 4)
+      .eq('status', 'failed').order('id', { ascending: false }).limit(5)
     if (failuresResult.error) throw new Error('通知队列读取失败。')
     const failureRows = failuresResult.data ?? []
     const recipientsResult = failureRows.length ? await admin.from('app_users').select('id,username').in('id', [...new Set(failureRows.map((row) => row.recipient_user_id))]) : { data: [], error: null }

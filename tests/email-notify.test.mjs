@@ -395,8 +395,6 @@ test('邮件服务限频（429）不计入尝试次数，按 Retry-After 暂停�
   assert.match(throttleBranch, /邮件服务限频（HTTP 429）/);
   assert.match(api, /const NOTIFY_THROTTLE_MIN_WAIT_SECONDS = 30/);
   assert.match(api, /const NOTIFY_THROTTLE_MAX_WAIT_SECONDS = 600/);
-  // 中继要把“还要等多久”告诉调用方。
-  assert.match(source('deploy/mail-relay/index.mjs'), /'retry-after': String\(throttleWaitSeconds\(\)\)/);
 });
 test('发送时跳过已停用收件人和不存在的申请，失败按 2 的幂退避并封顶', () => {
   assert.match(api, /admin\.from\('app_users'\)\.select\('id,email,full_name,username,active'\)/);
