@@ -387,7 +387,8 @@ begin
     raise exception '关闭类型的作废应保留原因';
   end if;
 
-  -- 投递前复核：领取之后再撤销身份（handler 里"领取后、投递前"的窗口），复核函数必须把这一行挡下。
+  -- 投递前复核（PR #19 终审 P2 起是“白名单”契约）：领取之后才发生的变化必须被挡住，而且只有数据库
+  -- 明确判定 send 的行才允许投递——没出现在结果里（旧版把缺席当放行）或判定 skip 的行一律不放行。
   perform public.app_update_email_notify(super_id, true, array['待财委审批','待主席审批','退回修改','待补充收款码','待付款登记','拒绝申请','已付款']);
   perform public.app_set_member_roles(super_id, finance_id, array['finance'], true);
   update public.applications set status = 'draft', version = 9 where id = app_id;
@@ -397,37 +398,98 @@ begin
   select id into allowed_row from public.notifications
    where application_id = app_id and application_version = 9 and event = '待财委审批' and recipient_user_id = super_id;
   if blocked_row is null or allowed_row is null then raise exception '前置条件失败：财委与内置 admin 都应收到待审批提醒'; end if;
-  perform public.app_claim_notifications(gen_random_uuid(), 200, 300, 24, 5);
-  if not exists(select 1 from public.notifications where id = blocked_row and status = 'sending') then raise exception '前置条件失败：待审批提醒应已被领取'; end if;
+  claim_1 := gen_random_uuid();
+  perform public.app_claim_notifications(claim_1, 200, 300, 24, 5);
+  if not exists(select 1 from public.notifications where id = blocked_row and status = 'sending' and claim_id = claim_1) then
+    raise exception '前置条件失败：待审批提醒应已被本批领取';
+  end if;
+
+  -- 1) 领取之后撤销身份：明确判 cancel，并带可读原因。
   perform public.app_set_member_roles(super_id, finance_id, array[]::text[], true);
-  result := public.app_notify_blocked_rows(array[blocked_row]);
+  result := public.app_notify_verify_rows(claim_1, array[blocked_row]);
   if not exists(select 1 from jsonb_array_elements(result) e
-                where (e->>'id')::bigint = blocked_row and e->>'reason' like '%不具备该待办的处理身份%') then
-    raise exception '领取后撤销身份的行应被投递前复核挡下，实际 %', result;
+                where (e->>'id')::bigint = blocked_row and e->>'verdict' = 'cancel'
+                  and e->>'reason' like '%不具备该待办的处理身份%') then
+    raise exception '领取后撤销身份的行应被投递前复核判为 cancel，实际 %', result;
   end if;
-  if exists(select 1 from jsonb_array_elements(public.app_notify_blocked_rows(array[allowed_row])) e
-            where (e->>'id')::bigint = allowed_row) then
-    raise exception '身份仍有效的行不应被投递前复核挡下';
+  -- 2) 身份与版本/状态都仍然成立的行必须被明确放行（“没出现在结果里就发”已经不再成立）。
+  result := public.app_notify_verify_rows(claim_1, array[allowed_row]);
+  if not exists(select 1 from jsonb_array_elements(result) e
+                where (e->>'id')::bigint = allowed_row and e->>'verdict' = 'send') then
+    raise exception '身份仍有效的行应被投递前复核明确放行，实际 %', result;
   end if;
-  -- 总开关只暂停、不作废：关掉总开关时，投递前复核不能把仍然勾选的类型判成"已关闭"（下一轮直接 skipped）。
+  -- 3) 总开关只暂停、不作废：关掉总开关不影响逐类勾选的行被放行（handler 下一轮直接 skipped）。
   perform public.app_update_email_notify(super_id, false, array['待财委审批','待主席审批','退回修改','待补充收款码','待付款登记','拒绝申请','已付款']);
-  if exists(select 1 from jsonb_array_elements(public.app_notify_blocked_rows(array[allowed_row])) e
-            where (e->>'id')::bigint = allowed_row) then
-    raise exception '总开关关闭只应暂停，不应被投递前复核当成作废';
+  result := public.app_notify_verify_rows(claim_1, array[allowed_row]);
+  if not exists(select 1 from jsonb_array_elements(result) e
+                where (e->>'id')::bigint = allowed_row and e->>'verdict' = 'send') then
+    raise exception '总开关关闭只应暂停，不应影响投递前复核的放行判定，实际 %', result;
   end if;
-  -- 反过来，逐类开关关掉后，正在发送的那一行必须在投递前被挡下。
+  -- 4) 反过来，逐类开关关掉后，正在发送的那一行必须判 cancel。
   perform public.app_update_email_notify(super_id, true, array['待主席审批','退回修改','待补充收款码','待付款登记','拒绝申请','已付款']);
-  if not exists(select 1 from jsonb_array_elements(public.app_notify_blocked_rows(array[allowed_row])) e
-                where (e->>'id')::bigint = allowed_row and e->>'reason' like '%已关闭%') then
-    raise exception '关掉某一类后，投递前复核应把该类正在发送的行挡下';
+  result := public.app_notify_verify_rows(claim_1, array[allowed_row]);
+  if not exists(select 1 from jsonb_array_elements(result) e
+                where (e->>'id')::bigint = allowed_row and e->>'verdict' = 'cancel' and e->>'reason' like '%已关闭%') then
+    raise exception '关掉某一类后，投递前复核应把该类正在发送的行判为 cancel，实际 %', result;
   end if;
-  -- 复核只认"正在发送"的行：把该类关掉 + 这一行改成 failed，复核仍必须忽略它
-  -- （只测"身份有效的 failed 行"是抓不到漏掉 status 过滤的：那种行本来也不会被返回）。
-  perform public.app_update_email_notify(super_id, true, array['待主席审批','退回修改','待补充收款码','待付款登记','拒绝申请','已付款']);
+
+  -- 5) 终审 P2 的核心：领取之后被工作流作废的行，旧版会因为“没出现在 blocked 结果里”而被放行寄出。
+  --    这里先恢复配置，再把这一行改成 cancelled（模拟移除收款码触发器的作废），复核必须判 skip：
+  --    既不放行，也不把它改回别的状态。
+  perform public.app_update_email_notify(super_id, true, array['待财委审批','待主席审批','退回修改','待补充收款码','待付款登记','拒绝申请','已付款']);
+  update public.notifications set status = 'cancelled', claim_id = null, lease_expires_at = now(),
+         last_error = '收款信息已变更，本次待付款登记提醒作废' where id = blocked_row;
+  result := public.app_notify_verify_rows(claim_1, array[blocked_row]);
+  if coalesce((select e->>'verdict' from jsonb_array_elements(result) e where (e->>'id')::bigint = blocked_row), 'absent') <> 'skip' then
+    raise exception '已被作废的提醒应判为 skip（缺席与 skip 都不是放行证据），实际 %', result;
+  end if;
+  if not exists(select 1 from public.notifications where id = blocked_row and status = 'cancelled' and claim_id is null) then
+    raise exception '投递前复核不应改动已作废行的状态';
+  end if;
+  -- 5b) 请求里不存在的 id：结果里没有它就是不放行（handler 只在拿到明确 send 时才投递）。
+  if public.app_notify_verify_rows(claim_1, array[9223372036854775807::bigint]) <> '[]'::jsonb then
+    raise exception '不存在的 id 不应出现在复核结果里（缺席不是放行）';
+  end if;
+
+  -- 6) 复核前已经失去本批租约（批次号变成别人的）的行同样只能 skip：不放行，也不被别人改状态。
+  result := public.app_notify_verify_rows(claim_2, array[allowed_row]);
+  if coalesce((select e->>'verdict' from jsonb_array_elements(result) e where (e->>'id')::bigint = allowed_row), 'absent') <> 'skip' then
+    raise exception '批次号不匹配的行应判为 skip，实际 %', result;
+  end if;
+  -- 6b) 缺少批次号（p_claim_id 为 null）时一行都不放行：即使那一行的 claim_id 也是 null，
+  --     `is distinct from` 也会为假，不能让它落进 send。
+  result := public.app_notify_verify_rows(null, array[allowed_row]);
+  if coalesce((select e->>'verdict' from jsonb_array_elements(result) e where (e->>'id')::bigint = allowed_row), 'absent') <> 'skip' then
+    raise exception '缺少批次号时不应放行任何行，实际 %', result;
+  end if;
+  -- 7) 租约已过期的行只能 skip：等中断恢复那条路处理，不能在这里寄出。
+  update public.notifications set lease_expires_at = now() - interval '1 minute' where id = allowed_row;
+  result := public.app_notify_verify_rows(claim_1, array[allowed_row]);
+  if coalesce((select e->>'verdict' from jsonb_array_elements(result) e where (e->>'id')::bigint = allowed_row), 'absent') <> 'skip' then
+    raise exception '租约已过期的行应判为 skip，实际 %', result;
+  end if;
+  update public.notifications set lease_expires_at = now() + interval '5 minutes' where id = allowed_row;
+  -- 8) 非 sending 的行同样只能 skip：把状态过滤写成“不属于本批就跳过”之后，这一条仍然要能抓住
+  --    漏掉状态/批次/租约过滤的改动（那一行其它条件全部成立，漏掉过滤就会变成 send）。
   update public.notifications set status = 'failed' where id = allowed_row;
-  if exists(select 1 from jsonb_array_elements(public.app_notify_blocked_rows(array[allowed_row])) e
-            where (e->>'id')::bigint = allowed_row) then
-    raise exception '投递前复核只应针对正在发送的行，非 sending 的行必须被忽略';
+  result := public.app_notify_verify_rows(claim_1, array[allowed_row]);
+  if coalesce((select e->>'verdict' from jsonb_array_elements(result) e where (e->>'id')::bigint = allowed_row), 'absent') <> 'skip' then
+    raise exception '投递前复核只应针对正在发送的行，非 sending 的行必须判为 skip，实际 %', result;
+  end if;
+  -- 9) 复核必须核对“申请当前的状态与版本”（handler 手里只有整批开始时读到的快照）。
+  --    先把这一行恢复成"本批正在发送"，再让申请离开该待办状态：必须判 cancel 而不是 send。
+  update public.notifications set status = 'sending', claim_id = claim_1, lease_expires_at = now() + interval '5 minutes'
+    where id = allowed_row;
+  update public.applications set status = 'draft' where id = app_id;
+  result := public.app_notify_verify_rows(claim_1, array[allowed_row]);
+  if coalesce((select e->>'verdict' from jsonb_array_elements(result) e where (e->>'id')::bigint = allowed_row), 'absent') <> 'cancel' then
+    raise exception '申请已离开该待办状态时，投递前复核必须判为 cancel（不能只看 handler 的旧快照），实际 %', result;
+  end if;
+  -- 10) 版本不一致（申请已重新提交）同样必须判 cancel。
+  update public.applications set status = 'finance_pending', version = 10 where id = app_id;
+  result := public.app_notify_verify_rows(claim_1, array[allowed_row]);
+  if coalesce((select e->>'verdict' from jsonb_array_elements(result) e where (e->>'id')::bigint = allowed_row), 'absent') <> 'cancel' then
+    raise exception '版本不一致的提醒必须被判为 cancel，实际 %', result;
   end if;
 
   update public.settings set email_notify_enabled = false where id = 1;

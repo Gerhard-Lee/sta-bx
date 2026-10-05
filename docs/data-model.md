@@ -1,6 +1,6 @@
 # 数据模型
 
-全部表在 `public` schema，内部辅助函数在 `private` schema。除特别说明外，每张表都 `enable row level security` 且对 `anon`/`authenticated` 执行过 `revoke all`——也就是说**只有 app-api（service role）能读写**，RLS 策略是历史遗留的第二层。
+业务表在 `public` schema，内部辅助函数在 `private`。除特别说明外，每张表都 `enable row level security` 且对 `anon`/`authenticated` 执行过 `revoke all`——**真正让客户端读不到数据的是"客户端角色没有任何表权限"**，RLS 策略是历史遗留的第二层（见 [architecture.md](architecture.md#分层与一次请求的完整路径)）。
 
 ## 一览
 
@@ -89,25 +89,9 @@ last_error text · created_at · sent_at
 -- unique index notifications_dedupe_idx(application_id, application_version, event, recipient_user_id) where status <> 'cancelled'
 ```
 
-状态流转与并发语义：
+`status` 的取值是 `pending | sending | sent | failed | cancelled`；`sending` 行由 `claim_id`（批次号）+ `lease_expires_at`（租约）保护，写回必须三者同时匹配。完整流转、复核与并发语义见 [notifications.md](notifications.md#队列状态机与并发)，这里不重复。
 
-```
-触发器入队 → pending ──app_claim_notifications（租约 + 批次号 + 超龄小时 + 失败上限）──► sending
-   pending ── 领取时复核不合格（身份撤销/停用/解绑邮箱、版本过期、该类型被管理员关闭）──► cancelled（终态，不寄出）
-   sending ── 每组投递前复核不合格（app_notify_blocked_rows：领取后撤身份/关类型）──► cancelled（终态，不寄出）
-   sending ── 发送成功 ──► sent
-   sending ── 状态已变（发送前复核失败）──► cancelled（终态，不寄出）
-   sending ── HTTP 429 限频 ──► pending（按 Retry-After 延后，不计 attempts）
-   sending ── 失败且 attempts < 5 ──► pending（next_attempt_at 退避）
-   sending ── 失败且 attempts >= 5 ──► failed（可用 app_reset_failed_notifications 退回 pending）
-   sending ── 一轮时间预算用尽 ──► pending（原样退回，不计 attempts）
-   sending ── 租约到期（进程被硬中断）且 attempts + 1 < 5 ──► pending，并计入一次 attempts
-   sending ── 租约到期且 attempts + 1 >= 5 或已超龄 ──► failed（"连续 N 次发送未完成"／"已丢弃"）
-   pending 且 created_at 超过 24 小时 ──► failed（原因："超过 24 小时未发送，已丢弃"）
-   本轮尚未作废的「待付款登记」提醒（含已发出的）── 收款码被移除（payment_pending → payment_info_required）──► cancelled
-```
-
-部分索引：`notifications_pending_idx(next_attempt_at) where status='pending'`、`notifications_lease_idx(lease_expires_at) where status='sending'`、`notifications_dedupe_idx(application_id, application_version, event, recipient_user_id) where status <> 'cancelled'`。完整规则见 [notifications.md](notifications.md)。
+部分索引：`notifications_pending_idx(next_attempt_at) where status='pending'`、`notifications_lease_idx(lease_expires_at) where status='sending'`、`notifications_dedupe_idx(application_id, application_version, event, recipient_user_id) where status <> 'cancelled'`。
 
 ## app_users / app_sessions
 
@@ -122,5 +106,5 @@ app_sessions: token_hash(sha256 hex, unique) · user_id → app_users (cascade)
 
 ## user_roles / audit_logs
 
-- `user_roles.role in ('finance','chair','cashier','admin')`；`cashier`（付款登记）目前**无法通过管理界面分配**，见 [known-issues.md](known-issues.md)。
+- `user_roles.role in ('finance','chair','admin')`（最终约束由 `supabase/admin-settings-audit.sql` 收敛；早期迁移里的 `cashier` 取值早已不可写入）。付款登记（`cashier`）**不是一行身份数据**，而是由 `finance` 派生的能力，见 [workflow.md](workflow.md#三个可分配身份--一个派生能力)。
 - `audit_logs`: `actor_id`（可空，空表示系统/定时任务）、`event`、`detail`、`username`、`ip_address`、`metadata jsonb`、`request_id uuid`、`created_at`。`event` 是中文短语，管理面板按它筛选展示。

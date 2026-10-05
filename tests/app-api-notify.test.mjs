@@ -162,15 +162,36 @@ class Fixture {
   async setEmailNotify(enabled, events) {
     await this.db.query('select public.app_update_email_notify($1, $2, $3::text[])', [this.superId, enabled, events]);
   }
+
+  // 走真实工作流造一份“已提交的收款码”：先存草稿（pending=true），再显式提交 → 申请进入 payment_pending，
+  // 触发器随即给付款登记身份（财委视同付款登记）入队「待付款登记」。
+  async saveQr(applicationId, ownerId) {
+    const result = await this.db.query(
+      "select public.app_save_workflow_file($1, $2, 'qr', $3, 'qr.png', 'image/png', '') as id",
+      [applicationId, ownerId, `${ownerId}/${applicationId}/qr.png`],
+    );
+    return result.rows[0].id;
+  }
+
+  async submitQr(applicationId, ownerId, fileId, recipient = '张三 支付宝') {
+    await this.db.query('select public.app_submit_workflow_file($1, $2, $3, $4, false)', [applicationId, ownerId, fileId, recipient]);
+  }
+
+  // 真实的收款码移除入口：申请退回 payment_info_required，触发器把本轮「待付款登记」提醒改成 cancelled。
+  async removeQr(applicationId, ownerId, fileId) {
+    await this.db.query('select public.app_remove_application_file($1, $2, $3)', [applicationId, ownerId, fileId]);
+  }
 }
 
-// 假邮件服务：只记录投递内容，返回 200，不发任何网络请求。
-function captureEmails() {
+// 假邮件服务：只记录投递内容，不发任何网络请求。
+// responder 可选：按每封邮件返回自定义 Response（覆盖 429 限频与 5xx 永久失败两条路），返回空则 200。
+function captureEmails(responder) {
   const originalFetch = globalThis.fetch;
   const emails = [];
   globalThis.fetch = async (url, options = {}) => {
-    emails.push({ url: String(url), headers: options.headers ?? {}, ...JSON.parse(String(options.body ?? '{}')) });
-    return new Response('ok', { status: 200 });
+    const mail = { url: String(url), headers: options.headers ?? {}, ...JSON.parse(String(options.body ?? '{}')) };
+    emails.push(mail);
+    return responder?.(mail, emails.length) ?? new Response('ok', { status: 200 });
   };
   return { emails, restore: () => { globalThis.fetch = originalFetch; } };
 }
@@ -178,10 +199,10 @@ function captureEmails() {
 // 走定时任务入口（x-app-cron），handle() 会调用同一个 drainNotifications(null)。
 // 注意 extraEnv 只在每次请求前注入 Deno.env：对 APP_URL / CRON_SECRET 这类"每次读取"的变量有效；
 // 模块级常量（NOTIFY_MAX_RUNTIME_MS、NOTIFY_* 预算）在 import 时就固化了，改它们必须换 variant。
-async function drain(client, { variant = 'default', extraEnv = {} } = {}) {
+async function drain(client, { variant = 'default', extraEnv = {}, mailResponder } = {}) {
   const { variants } = await buildHandler();
   const { handler, env } = variants[variant];
-  const mail = captureEmails();
+  const mail = captureEmails(mailResponder);
   const originalClient = globalThis.__STABX_TEST_CLIENT__;
   globalThis.__STABX_TEST_CLIENT__ = client;
   globalThis.__STABX_TEST_ENV__ = { ...env, ...extraEnv };
@@ -237,7 +258,7 @@ test('基线：开关打开、财委绑了邮箱、申请待财委审批 → 定
   assert.equal(after.row.claim_id, null, 'sent 行应释放批次号');
 });
 
-test('P1 复现：领取之后、投递之前撤销财委身份 → sent: 0、行变 cancelled（handler 确实调用 app_notify_blocked_rows）', { timeout: SQL_STACK_TIMEOUT }, async () => {
+test('P1 复现：领取之后、投递之前撤销财委身份 → sent: 0、行变 cancelled（handler 确实调用 app_notify_verify_rows）', { timeout: SQL_STACK_TIMEOUT }, async () => {
   const { db } = await stack();
   const fixture = await new Fixture(db).init();
   const client = createSqlClient(db);
@@ -283,8 +304,9 @@ test('P1 复现：领取之后、投递之前撤销财委身份 → sent: 0、�
 
   // 字符串断言：这条用例抓的是"handler 在每个发送组之前调用复核 RPC"这个行为。
   // 去掉那次调用（见报告里的临时验证）后，上面的 sent:0 / emails:0 断言就会失败。
-  assert.match(API_SOURCE_TEXT, /rpc\('app_notify_blocked_rows'/, 'handler 必须在投递前调用 app_notify_blocked_rows');
+  assert.match(API_SOURCE_TEXT, /rpc\('app_notify_verify_rows'/, 'handler 必须在投递前调用 app_notify_verify_rows');
   assert.match(API_SOURCE_TEXT, /const recheckGroup = async/, '投递前复核应集中在 recheckGroup');
+  assert.match(API_SOURCE_TEXT, /if \(verdict\?\.verdict !== 'send'\)/, '只有明确判 send 的行才允许投递');
 });
 
 test('领取之后关闭「待财委审批」提醒 → sent: 0、行变 cancelled 且原因含"已关闭"', { timeout: SQL_STACK_TIMEOUT }, async () => {
@@ -379,10 +401,10 @@ test('投递前复核接口失败时不烧队列：本组退回 pending、写审
   const { db } = await stack();
   const fixture = await new Fixture(db).init();
   const client = createSqlClient(db);
-  // 只让 app_notify_blocked_rows 出错（模拟 PostgREST schema 缓存未刷新/暂时不可用），其余 RPC 正常。
+  // 只让 app_notify_verify_rows 出错（模拟 PostgREST schema 缓存未刷新/暂时不可用），其余 RPC 正常。
   const brokenClient = {
     ...client,
-    rpc: (name, args) => (name === 'app_notify_blocked_rows'
+    rpc: (name, args) => (name === 'app_notify_verify_rows'
       ? Promise.resolve({ data: null, error: { message: 'PGRST002 could not query the database for the schema cache' } })
       : client.rpc(name, args)),
   };
@@ -411,6 +433,258 @@ test('投递前复核接口失败时不烧队列：本组退回 pending、写审
   assert.ok(audit, '复核失败也要写审计，否则日志里什么都看不到');
   assert.match(audit.detail, /投递前复核失败 1 组/);
   assert.equal(after.row.recipient_user_id, finance, '退回的那一行仍指向原来的收件人');
+});
+
+// PR #19 终审 P2：旧版复核是 blocked 契约，handler 把“没出现在结果里”当成放行。
+// 领取之后、投递之前被工作流作废的行会从结果里消失，于是这封多余的旧付款提醒反而被寄出。
+// 这条用例在真实 PGlite + 真实 handler 上复现完整时间线：领取 → 读取申请快照 → 复核前一刻用真实
+// app_remove_application_file 移除收款码（申请退回 payment_info_required，触发器把该行改成 cancelled）
+// → 复核。邮件服务必须一封都没收到，且原行保持工作流写下的 cancelled。
+test('终审 P2：复核前用真实 RPC 移除收款码作废付款提醒 → 不投递，原行仍 cancelled', { timeout: SQL_STACK_TIMEOUT }, async () => {
+  const { db } = await stack();
+  const fixture = await new Fixture(db).init();
+  const client = createSqlClient(db);
+
+  // 只开「待付款登记」：移除收款码会把申请退回 payment_info_required，若「待补充收款码」也开着，
+  // 那一封新的待办会照常寄出（维护者复现时也提到它会掩盖多出来的旧邮件），断言就不再指向付款提醒。
+  await fixture.setEmailNotify(true, ['待付款登记']);
+  const owner = await fixture.user('owner_qr_void', { email: 'qr-void-owner@example.com' });
+  // 付款登记视同财委（20261005010000），所以带 finance 身份的成员就是「待付款登记」的收件人。
+  const cashier = await fixture.user('cashier_qr_void', { email: 'qr-void-cashier@example.com', roles: ['finance'] });
+  const applicationId = await fixture.application(owner, { title: '已作废的付款提醒不应寄出' });
+
+  // 走真实工作流：进入待补充收款码 → 存收款码草稿 → 显式提交（申请变 payment_pending，入队待付款登记）。
+  await fixture.setStatus(applicationId, 'payment_info_required', 1);
+  const qrFileId = await fixture.saveQr(applicationId, owner);
+  await fixture.submitQr(applicationId, owner, qrFileId);
+  // 本用例只考察「待付款登记」这一行：清掉同一申请上的其它提醒（待补充收款码等），断言才指向付款提醒。
+  await db.query("delete from public.notifications where application_id = $1 and event <> '待付款登记'", [applicationId]);
+
+  const queued = await fixture.notification(applicationId, '待付款登记');
+  assert.equal(queued.rows.length, 1, '待付款登记应在队列里生成 1 行');
+  assert.equal(queued.row.status, 'pending');
+  assert.equal(queued.row.recipient_user_id, cashier, '付款提醒应发给付款登记身份');
+
+  // 钩子挂在“真正调用投递前复核 RPC”之前：此时申请快照已经被 handler 读走，复核看到的必须是作废后的事实。
+  let voidedBeforeRecheck = false;
+  const originalRpc = client.rpc.bind(client);
+  client.rpc = async (name, args) => {
+    if (name === 'app_notify_verify_rows' && !voidedBeforeRecheck) {
+      voidedBeforeRecheck = true;
+      await fixture.removeQr(applicationId, owner, qrFileId);
+      const mid = await fixture.notification(applicationId, '待付款登记');
+      assert.equal(mid.row.status, 'cancelled', '前置条件失败：移除收款码必须作废正在发送的付款提醒');
+      assert.equal(mid.row.claim_id, null, '前置条件失败：作废必须释放批次号');
+      assert.match(mid.row.last_error, /收款信息已变更/, '作废原因应来自工作流触发器');
+    }
+    return originalRpc(name, args);
+  };
+
+  const result = await drain(client);
+  assert.ok(voidedBeforeRecheck, '用例必须真的在投递前复核之前作废这一行');
+  assert.equal(result.status, 200, JSON.stringify(result.payload));
+  assert.equal(result.payload.error, null);
+  assert.equal(result.payload.data.sent, 0, '已经作废的付款提醒不能再寄出');
+  assert.equal(result.payload.data.cancelled, 0, '这一行的 cancelled 是工作流写的，不该记成本轮复核作废');
+  assert.equal(result.payload.data.stale, 1, `复核应把它判成跳过，实际 ${JSON.stringify(result.payload.data)}`);
+  assert.equal(result.emails.filter((mail) => mail.to === 'qr-void-cashier@example.com').length, 0, '财委不应收到已作废的付款提醒');
+  assert.equal(result.emails.length, 0, '假邮件服务不应收到任何邮件');
+
+  const after = await fixture.notification(applicationId, '待付款登记');
+  assert.equal(after.row.status, 'cancelled', '原行必须保持工作流的 cancelled，复核不能把它改回别的状态');
+  assert.equal(after.row.claim_id, null);
+  assert.match(after.row.last_error, /收款信息已变更/);
+  const application = await db.query('select status from public.applications where id = $1', [applicationId]);
+  assert.equal(application.rows[0].status, 'payment_info_required', '申请应已被退回待补充收款码');
+  const audit = await fixture.latestAudit('发送邮件提醒');
+  assert.match(audit.detail, /投递前复核跳过 1 封/);
+});
+
+// 终审 P2 的第二半：“复核前已经失去本批租约”的行同样只能跳过——旧版把它当成放行，会重复投递。
+test('终审 P2：复核前已失去本批租约的行不投递，也不被改回任何状态', { timeout: SQL_STACK_TIMEOUT }, async () => {
+  const { db } = await stack();
+  const fixture = await new Fixture(db).init();
+  const client = createSqlClient(db);
+
+  await fixture.setEmailNotify(true, ['待财委审批']);
+  const owner = await fixture.user('owner_lost_claim', { email: 'lost-claim-owner@example.com' });
+  const finance = await fixture.user('finance_lost_claim', { email: 'lost-claim-finance@example.com', roles: ['finance'] });
+  const applicationId = await fixture.application(owner, { title: '失去租约的行不应寄出' });
+  await fixture.setStatus(applicationId, 'finance_pending', 1);
+  const queued = await fixture.notification(applicationId);
+  assert.equal(queued.rows.length, 1);
+  assert.equal(queued.row.status, 'pending');
+
+  // 本批租约到期后由另一个批次接手：行仍在 sending，但批次号已经换成别人的。
+  const otherClaim = '00000000-0000-4000-8000-00000000c1a1';
+  let hijackedBeforeRecheck = false;
+  const originalRpc = client.rpc.bind(client);
+  client.rpc = async (name, args) => {
+    if (name === 'app_notify_verify_rows' && !hijackedBeforeRecheck) {
+      hijackedBeforeRecheck = true;
+      await db.query('update public.notifications set claim_id = $2 where id = $1', [queued.row.id, otherClaim]);
+    }
+    return originalRpc(name, args);
+  };
+
+  const result = await drain(client);
+  assert.ok(hijackedBeforeRecheck, '用例必须真的在复核之前换掉批次号');
+  assert.equal(result.status, 200, JSON.stringify(result.payload));
+  assert.equal(result.payload.data.sent, 0, '不属于本批的行不能再寄出');
+  assert.equal(result.payload.data.stale, 1, `复核应把它判成跳过，实际 ${JSON.stringify(result.payload.data)}`);
+  assert.equal(result.emails.length, 0);
+
+  const after = await fixture.notification(applicationId);
+  assert.equal(after.row.status, 'sending', '别的批次正在发送的行不能被改回 pending/failed');
+  assert.equal(after.row.claim_id, otherClaim, '批次号必须保持别的批次，不能被本批覆盖');
+  assert.equal(after.row.attempts, 0, '跳过不能消耗尝试次数');
+  assert.equal(finance, after.row.recipient_user_id);
+});
+
+// 旧 blocked 契约的返回值形状（只列"不该发"的行）不能再被接受：handler 必须按白名单执行，
+// 结果里缺席的 id 一律不投递。这条用例直接以"复核返回空数组"模拟那种旧契约/漏行的数据库侧实现，
+// 把"缺席即放行"这个具体回归钉在 handler 上（单靠 SQL 侧的显式 skip 是抓不到 handler 改回去的）。
+test('复核结果缺席的 id 不能当成放行（旧 blocked 契约的返回值不再被接受）', { timeout: SQL_STACK_TIMEOUT }, async () => {
+  const { db } = await stack();
+  const fixture = await new Fixture(db).init();
+  const client = createSqlClient(db);
+  const emptyVerdicts = {
+    ...client,
+    rpc: (name, args) => (name === 'app_notify_verify_rows'
+      ? Promise.resolve({ data: [], error: null })
+      : client.rpc(name, args)),
+  };
+
+  await fixture.setEmailNotify(true, DEFAULT_EVENTS);
+  const owner = await fixture.user('owner_empty_verdict', { email: 'empty-verdict-owner@example.com' });
+  const finance = await fixture.user('finance_empty_verdict', { email: 'empty-verdict-finance@example.com', roles: ['finance'] });
+  const applicationId = await fixture.application(owner, { title: '复核没给判定的行不应寄出' });
+  await fixture.setStatus(applicationId, 'finance_pending', 1);
+  assert.equal((await fixture.notification(applicationId)).rows.length, 1);
+
+  const result = await drain(emptyVerdicts);
+  assert.equal(result.status, 200, JSON.stringify(result.payload));
+  assert.equal(result.payload.data.sent, 0, '没有明确 send 判定就不能投递');
+  assert.equal(result.payload.data.stale, 1, `缺席的行应计进跳过，实际 ${JSON.stringify(result.payload.data)}`);
+  assert.equal(result.emails.length, 0);
+
+  const after = await fixture.notification(applicationId);
+  assert.equal(after.row.status, 'sending', '没有被放行的行不能被改成别的状态（留给租约恢复那条路）');
+  assert.ok(after.row.claim_id, '没有判定不等于放弃租约：批次号应保持原样');
+  assert.equal(after.row.attempts, 0, '跳过不能消耗尝试次数');
+  assert.equal(after.row.recipient_user_id, finance);
+});
+
+// 同一行不能被计两次：复核判 skip 的行在收尾时会被退回队列，旧代码把它同时计进「跳过」与「退回」，
+// 6 行的队列会报出 7 个封数；审计里的"跳过 N 封…本轮均未投递"也可能是假话（那一行其实被后续轮次寄出了）。
+// 这条用例造一个满组（5 行，其中 1 行的租约在复核前过期 → 复核判 skip）+ 一个尾组（1 行，复核接口报错 → 本轮收尾）。
+test('复核跳过的行不再被重复计进「本轮退回」：6 行提醒的封数必须对齐', { timeout: SQL_STACK_TIMEOUT }, async () => {
+  const { db } = await stack();
+  const fixture = await new Fixture(db).init();
+  const client = createSqlClient(db);
+
+  await fixture.setEmailNotify(true, ['待财委审批']);
+  await fixture.user('finance_accounting', { email: 'accounting-finance@example.com', roles: ['finance'] });
+  for (let index = 0; index < 6; index++) {
+    const owner = await fixture.user(`owner_accounting_${index}`, { email: `accounting-owner-${index}@example.com` });
+    const applicationId = await fixture.application(owner, { title: `封数对齐 ${index}` });
+    await fixture.setStatus(applicationId, 'finance_pending', 1);
+  }
+  const queued = await db.query("select count(*)::int as total from public.notifications where status = 'pending'");
+  assert.equal(queued.rows[0].total, 6, '应生成 6 行待发提醒');
+
+  let skippedId = null;
+  let verifyCalls = 0;
+  const originalRpc = client.rpc.bind(client);
+  client.rpc = async (name, args) => {
+    if (name !== 'app_notify_verify_rows') return originalRpc(name, args);
+    verifyCalls++;
+    if (verifyCalls === 1) {
+      // 首组：把第一行的租约压到过期（行仍是本批的），真实复核会判 skip。
+      skippedId = Number(args.p_ids[0]);
+      await db.query("update public.notifications set lease_expires_at = now() - interval '1 minute' where id = $1", [skippedId]);
+      return originalRpc(name, args);
+    }
+    // 尾组：模拟 PostgREST 暂时不可用，本轮收尾（把没动过的行退回队列）。
+    return { data: null, error: { message: 'PGRST002 could not query the database for the schema cache' } };
+  };
+
+  const result = await drain(client);
+  assert.equal(result.status, 200, JSON.stringify(result.payload));
+  const data = result.payload.data;
+  assert.equal(data.sent, 4, `首组 5 行里 4 行应寄出，实际 ${JSON.stringify(data)}`);
+  assert.equal(data.recheck_failed, 1);
+  assert.equal(data.deferred, 2, `尾组 1 行 + 首组 skip 的 1 行都要退回，实际 ${JSON.stringify(data)}`);
+  assert.equal(data.stale, 0, `被收尾退回的 skip 行不能再计进「跳过」，实际 ${JSON.stringify(data)}`);
+  const accounted = data.sent + data.failed + data.retried + data.cancelled + data.deferred + data.discarded + data.stale;
+  assert.equal(accounted, 6, `6 行提醒的封数必须对齐（同一行只能计一次），实际 ${JSON.stringify(data)}`);
+
+  // 被 skip 的那一行确实退回了队列，且原因是"复核失败"，不是"本轮时间用尽"（预算根本没用到）。
+  const skipped = await db.query('select status, claim_id, attempts, last_error from public.notifications where id = $1', [skippedId]);
+  assert.equal(skipped.rows[0].status, 'pending');
+  assert.equal(skipped.rows[0].claim_id, null);
+  assert.equal(skipped.rows[0].attempts, 0, '退回不消耗尝试次数');
+  assert.equal(skipped.rows[0].last_error, '投递前复核失败，本轮未继续，已退回队列');
+
+  const audit = await fixture.latestAudit('发送邮件提醒');
+  assert.match(audit.detail, /投递前复核跳过 0 封/);
+  assert.match(audit.detail, /本轮退回 2 封/);
+  assert.equal(/本轮均未投递/.test(audit.detail), false, '审计不能断言"未投递"：被 skip 的行可能由后续轮次寄出');
+});
+
+// failed 也是终态：批次号必须和 sent/cancelled/pending 一样释放掉，否则库里留着已经结束的批次指针。
+test('投递失败到上限（failed 终态）也要释放批次号', { timeout: SQL_STACK_TIMEOUT }, async () => {
+  const { db } = await stack();
+  const fixture = await new Fixture(db).init();
+  const client = createSqlClient(db);
+
+  await fixture.setEmailNotify(true, ['待财委审批']);
+  const owner = await fixture.user('owner_failed_claim', { email: 'failed-claim-owner@example.com' });
+  await fixture.user('finance_failed_claim', { email: 'failed-claim-finance@example.com', roles: ['finance'] });
+  const applicationId = await fixture.application(owner, { title: '失败终态释放批次号' });
+  await fixture.setStatus(applicationId, 'finance_pending', 1);
+  // 预置到失败上限的前一次：这一封失败就直接落 failed（不用连跑 5 轮）。
+  await db.query('update public.notifications set attempts = 4 where application_id = $1', [applicationId]);
+
+  const result = await drain(client, { mailResponder: () => new Response('boom', { status: 500 }) });
+  assert.equal(result.status, 200, JSON.stringify(result.payload));
+  assert.equal(result.payload.data.failed, 1, JSON.stringify(result.payload.data));
+  assert.equal(result.payload.data.retried, 0);
+
+  const after = await fixture.notification(applicationId);
+  assert.equal(after.row.status, 'failed');
+  assert.equal(after.row.attempts, 5);
+  assert.equal(after.row.claim_id, null, 'failed 终态也要释放批次号（此前只有 sent/cancelled/pending 清了）');
+});
+
+// 收件地址不能只看"整批开始时读到的快照"：复核只判"有没有邮箱"，判不了地址还是不是这一个。
+// 这条用例在复核之前（快照已读完之后）由本人改绑邮箱，投递必须用改绑后的地址。
+test('复核通过后按当前邮箱投递：本人改绑邮箱不会把申请详情寄到旧地址', { timeout: SQL_STACK_TIMEOUT }, async () => {
+  const { db } = await stack();
+  const fixture = await new Fixture(db).init();
+  const client = createSqlClient(db);
+
+  await fixture.setEmailNotify(true, ['待财委审批']);
+  const owner = await fixture.user('owner_addr_fresh', { email: 'addr-fresh-owner@example.com' });
+  const finance = await fixture.user('finance_addr_fresh', { email: 'addr-fresh-old@example.com', roles: ['finance'] });
+  const applicationId = await fixture.application(owner, { title: '改绑邮箱后投递' });
+  await fixture.setStatus(applicationId, 'finance_pending', 1);
+
+  let rebound = false;
+  const originalRpc = client.rpc.bind(client);
+  client.rpc = async (name, args) => {
+    if (name === 'app_notify_verify_rows' && !rebound) {
+      rebound = true;
+      await db.query('select public.app_bind_email($1, $1, $2)', [finance, 'addr-fresh-new@example.com']);
+    }
+    return originalRpc(name, args);
+  };
+
+  const result = await drain(client);
+  assert.ok(rebound, '用例必须真的在复核之前改绑邮箱');
+  assert.equal(result.payload.data.sent, 1, JSON.stringify(result.payload.data));
+  assert.equal(result.emails.length, 1);
+  assert.equal(result.emails[0].to, 'addr-fresh-new@example.com', '必须寄到改绑后的地址，而不是整批快照里的旧地址');
 });
 
 test('结果通知开关：拒绝申请未勾选时入队被拒，勾选后出现该行', { timeout: SQL_STACK_TIMEOUT }, async () => {

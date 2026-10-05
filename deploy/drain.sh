@@ -17,7 +17,8 @@ fi
 : "${CRON_SECRET:?缺少 CRON_SECRET}"
 
 # -f：非 2xx 时以非 0 退出，让 cron 的邮件/日志能看见失败；--max-time 防止卡住下一次调度。
-# 注意：--max-time 必须大于函数侧一轮消费的预算（NOTIFY_MAX_RUNTIME_MS，默认 240 秒）。
+# 注意：--max-time 必须大于函数侧一轮消费的预算（NOTIFY_MAX_RUNTIME_MS：托管默认 110 秒，
+# 本 compose 覆盖把它设成 240 秒）。
 # 客户端先超时断开的话，函数来不及把没发送的行退回队列，它们会卡在“发送中”直到租约到期（并多算一次尝试）。
 curl -fsS --max-time "${STABX_NOTIFY_TIMEOUT:-300}" -X POST "${STABX_URL%/}/functions/v1/app-api" \
   -H "apikey: ${STABX_APIKEY}" \

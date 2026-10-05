@@ -5,7 +5,7 @@
 | 来源 | 内容 | 说明 |
 | --- | --- | --- |
 | `supabase/migrations/<时间戳>_*.sql` | 9 条迁移（其中 4 条带同名 `.verify.sql`） | 新改动一律进这里 |
-| `supabase/*.sql`（根目录散装） | `admin-settings-audit.sql`、`member-management-and-resubmission.sql`、`detailed-file-and-review-audit.sql`、`explicit-submission.sql`（各有同名 `.verify.sql`） | 历史遗留：早期直接在 Dashboard 的 SQL 编辑器里执行，没进迁移账本 |
+| `supabase/*.sql`（根目录散装） | `admin-settings-audit.sql`、`member-management-and-resubmission.sql`、`explicit-submission.sql` 三份带同名 `.verify.sql`；`detailed-file-and-review-audit.sql` **没有** verify | 历史遗留：早期直接在 Dashboard 的 SQL 编辑器里执行，没进迁移账本 |
 
 ### 现有迁移清单
 
@@ -17,7 +17,7 @@
 | `20260929181000_custom_app_users_crypto_search_path.sql` | 给用到 pgcrypto 的三个函数补 `extensions` 搜索路径（否则 `crypt`/`gen_salt` 找不到） |
 | `20260929190000_admin_all_permissions.sql` | 一度把"拥有 `admin` 即视同所有流程身份"写进 `app_user_has_role`——**已被下一条推翻**，保留是因为迁移历史不可改写 |
 | `20261002133000_separate_admin_and_workflow_roles.sql` + verify | 管理员与流程身份分离；新增 `app_user_is_superadmin`，只有内置 `admin` 跨身份 |
-| `20261004210000_email_notify.sql` + verify | 邮箱绑定、七类事件的通知队列与触发器、`settings.email_notify_events` 逐类开关、带租约的原子领取（五参数：批次号/上限/租约秒/超龄小时/失败上限）、领取时身份/版本/类型复核与 `app_notify_blocked_rows` 投递前复核、发送前状态复核与 `cancelled` 终态、依赖 fail-fast 检查 |
+| `20261004210000_email_notify.sql` + verify | 邮箱绑定、七类事件的通知队列与触发器、状态 ↔ 事件映射（`private.app_notify_event_for_status`，触发器与投递前复核同源）、`settings.email_notify_events` 逐类开关、带租约的原子领取（五参数：批次号/上限/租约秒/超龄小时/失败上限）、领取时身份/版本/类型复核与 `app_notify_verify_rows` 白名单投递前复核（send/cancel/skip）、发送前状态复核与 `cancelled` 终态、依赖 fail-fast 检查 |
 | `20261005010000_finance_can_record_payment.sql` + verify | 付款登记视同财委身份：重定义 `private.app_user_has_role`，让 `finance` 通过 `cashier` 判定（PR #15 已合并）；通知触发器无需改动即继承新语义 |
 | `20261005140000_email_notify_cron.sql` + verify | 可选的 pg_cron 登记函数 `app_register_email_cron()`（探测扩展与 GUC，缺扩展或未配置参数时只输出提示并跳过）；登记逻辑抽成 `private.app_schedule_email_cron(...)`，显式传 pg_net 的 `timeout_milliseconds`（默认 140 秒，可用 `stabx.email_cron_timeout_ms` 调大）；verify 在没有真实 pg_cron 的测试库里用 cron 桩直接验证登记 SQL |
 
@@ -33,15 +33,25 @@ end if;
 
 真实项目上这些早就在账本里了，所以维护时只需要"新迁移排在最后"。若要在一只空库上从零建起，顺序由**依赖**决定（不是简单的"散装 SQL 先、迁移后"）：
 
-1. **基线段迁移**：`20260929130000_funds.sql`（`settings`/`profiles`/业务表）→ `20260929130500` → `20260929180000_custom_app_users.sql`（`app_users`/`app_sessions`）→ `20260929181000` → `20260929190000` → `20261002133000_separate_admin_and_workflow_roles.sql` → `20261005010000_finance_can_record_payment.sql`。四份散装 SQL 全是对既有表的 `alter`，表还不存在时第一步就报 `relation "public.settings" does not exist`；后两条提供 `private.app_user_has_role` 的当前语义，散装 SQL 会调用它。
-2. **四份散装 SQL**：`admin-settings-audit.sql`、`member-management-and-resubmission.sql`、`detailed-file-and-review-audit.sql`、`explicit-submission.sql`。
-3. **内置 `admin` 账号**（空库时）：所有 `.verify.sql` 与多个 RPC 都假设它存在。建号位置只有一个可插入点——在 `admin-settings-audit.sql`（提供 `private.app_insert_user`）**之后**、`member-management-and-resubmission.sql` **之前**：后者装上的 `protect_builtin_admin` 触发器会让任何补写角色的语句抛"admin 的权限已锁定，任何用户都不能修改"。真实项目上这个账号本来就存在。
-4. **其余迁移**按文件名时间戳升序：`20261004210000_email_notify.sql`、`20261005140000_email_notify_cron.sql`。前者开头的 fail-fast 会检查第 2 步是否完成。
-5. 每个结构文件之后执行同名 `.verify.sql`（各自包在 `begin; … rollback;` 里）。
+1. **基线段迁移**：`20260929130000_funds.sql`（`settings`/`profiles`/业务表）→ `20260929130500` → `20260929180000_custom_app_users.sql`（`app_users`/`app_sessions`）→ `20260929181000` → `20260929190000` → `20261002133000_separate_admin_and_workflow_roles.sql` → `20261005010000_finance_can_record_payment.sql`。散装 SQL 全是对既有表的 `alter`，表还不存在时第一步就报 `relation "public.settings" does not exist`；后两条提供 `private.app_user_has_role` 的当前语义，散装 SQL 会调用它。
+2. **散装 SQL 第一份**：`admin-settings-audit.sql`（提供 `private.app_insert_user`、`app_admin_create_user`、以及 `user_roles_role_check` 的最终定义）。
+3. **内置 `admin` 账号**（只在空库上需要）：所有 `.verify.sql` 与多个 RPC 都假设它存在，而建号位置**只有一个可插入点**——必须在第 2 步之后、第 4 步之前：`member-management-and-resubmission.sql` 装上的 `protect_builtin_admin` 触发器会让任何补写角色的语句抛"admin 的权限已锁定，任何用户都不能修改"。口令必须是 10–72 位（`private.app_insert_user` 会校验），具体两条语句：
+   ```sql
+   do $$
+   declare super_id uuid;
+   begin
+     super_id := (private.app_insert_user('admin', '换成至少10位的强口令', '内置管理员', '管理') ->> 'id')::uuid;
+     insert into public.user_roles(user_id, role) values (super_id, 'admin');
+   end $$;
+   ```
+   真实项目上这个账号本来就存在，不需要重跑。
+4. **其余散装 SQL**：`member-management-and-resubmission.sql`、`detailed-file-and-review-audit.sql`、`explicit-submission.sql`（顺序按文件名列表即可，它们之间没有依赖）。
+5. **其余迁移**按文件名时间戳升序：`20261004210000_email_notify.sql`、`20261005140000_email_notify_cron.sql`。前者开头的 fail-fast 会检查第 2 步是否完成。
+6. 每个结构文件之后执行**同名 `.verify.sql`（有的话）**，各自包在 `begin; … rollback;` 里。verify 依赖"最终结构"：它们会调用 `private.app_user_has_role`、`private.app_insert_user`、`public.app_list_members` 等最终形态的函数，所以要**在一整套结构都建好之后**再跑，不要夹在中间。
 
-顺序错了不会污染数据，但会报"函数不存在"或"表不存在"。**这份顺序有可执行版本**：`tests/sql-migrations.test.mjs` 在 PGlite 上按上面四步跑完整栈，改顺序会让它直接失败。
+顺序错了不会污染数据，但会报"函数不存在"或"表不存在"。**这份顺序有可执行版本**：`tests/sql-migrations.test.mjs` 在 PGlite 上按同样的顺序（基线段 → 第 1 份散装 SQL → 内置 admin → 其余散装 SQL → 其余迁移 → 全部 `verify`）把整套 SQL 真跑一遍，改顺序会让它直接失败。
 
-> 用 Supabase CLI 管理时注意：手工执行过的 SQL 不在迁移账本里，需要 `supabase migration repair --status applied` 标记，否则 `db push` 会重复执行或报冲突。
+> 用 Supabase CLI 管理时注意：手工执行过的 SQL 不在迁移账本里。**`supabase migration repair --status applied` 只改账本（history 表），不会执行任何 SQL**——结构缺东西要先补迁移或经核实的 SQL，只有在"记录与实际不符"时才用它修记录。根目录那几份散装 SQL 没有时间戳、也不是迁移，不要笼统地把它们标成 applied。
 
 ## 写迁移的规矩
 
@@ -55,28 +65,12 @@ end if;
 
 ## verify 脚本的写法
 
-```sql
-begin;
-do $$
-declare …
-begin
-  select … into flag from public.settings where id = 1;
-  if flag is distinct from false then raise exception '…应为…'; end if;
-  begin
-    perform public.app_bind_email(new_id, new_id, 'not-an-email');
-    raise exception '非法邮箱应被拒绝';
-  exception when raise_exception then
-    if sqlerrm not like '%邮箱格式不正确%' then raise; end if;   -- 预期内的错误吞掉，其他照抛
-  end;
-end $$;
-rollback;
-```
+结构固定：`begin;` → 一个 `do $$ … $$;` 块 → `rollback;`，全程不落数据。**要点是驱动真实数据变化来验证行为**，而不是只查对象存在：例如通知的 verify 会真的插申请、改状态、检查队列里出现了谁的行、重复状态是否去重、领取是否带租约、超龄是否丢弃、身份撤销后是否作废、反复中断是否在第五次转 `failed`、非管理员是否被拒。造用户用 `private.app_insert_user`，分配角色借用内置 `admin`（缺该账号时直接抛错，与其他 verify 一致）。
 
-要点：**驱动真实数据变化来验证行为**，而不是只查对象存在。例如通知的验证会真的插一条申请、改状态、检查队列里出现了谁的行、重复状态是否被去重、领取是否带租约、超龄是否丢弃、身份撤销后是否作废、反复中断是否在第五次转 `failed`、非管理员是否被拒。需要造用户时用 `private.app_insert_user`，需要分配角色时借用内置 `admin`（缺该账号时直接抛错，与其他 verify 脚本一致）。
-
-两条踩过的坑：
+三条踩过的坑：
 
 - **`RAISE` 不能用 `||` 拼字符串**：`raise exception '实际 ' || queued` 是语法错误（`syntax error at or near "||"`），整个 `DO` 块还没开始验证就退出。用占位符：`raise exception '实际 %', queued`（多个值时依次给参数）。
+- **`pg_attribute.attname` 是 `name` 类型**：`array_agg(a.attname)` 与 `text[]` 字面量比较会在**解析期**报 `operator does not exist: name[] = text[]`（即使表上没有任何旧约束也照样报）。显式转文字：`array_agg(a.attname::text order by a.attname)`。
 - **不要写死"恰好 N 封"**：收件人依赖 `private.app_user_has_role`，权限规则变化（例如"付款登记视同财委"）会让数量改变。用同一处判定函数推出期望集合，再和实际行做集合比较，并显式断言前置条件（确实是两个合格收件人），否则"期望 == 实际"会退化成永真的空断言。
 
 ## 本机没有 CLI / 没有 Docker 怎么执行

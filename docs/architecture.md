@@ -17,9 +17,9 @@ app-api（supabase/functions/app-api/index.ts）
   └── admin.storage.from(bucket)     ──► Storage（上传、删除、createSignedUrl 300 秒）
 ```
 
-- **前端不直连数据库**：`app_users`、`applications` 等表对 `anon`/`authenticated` 全部 `revoke`，RLS 也没有放行策略；能读到数据的只有持 service key 的 app-api。
+- **前端不直连数据库**：业务表对 `anon`/`authenticated` 全部 `revoke`，能读到数据的只有持 service key 的 app-api。隔离靠两件事叠加：**客户端角色没有任何表权限**（这是真正的边界），加上 RLS。注意早期迁移（`20260929130000_funds.sql`）留下的、基于 `auth.uid()` 的旧策略仍在库里，它们只是历史残留，不要再往上加策略，也不要以为"没有放行策略"就是隔离的全部理由。
 - **业务规则写在 PL/pgSQL 里**（`app_submit_application`、`private.app_review_application`、`app_save_workflow_file`…），HTTP 层只做鉴权、参数整形和错误翻译。这样即使有人绕过前端直接打函数，规则仍然成立。
-- **函数一律 `security definer` + `set search_path = public, private, pg_temp`**，并且 `revoke ... from public, anon, authenticated` + `grant execute ... to service_role`：只有 app-api 能调用。
+- **对外暴露的函数一律 `security definer` + `set search_path = public, private, pg_temp`**，并且 `revoke ... from public, anon, authenticated` + `grant execute ... to service_role`：只有 app-api 能调用。触发器函数与 `private` 辅助函数不在此列（它们由数据库自己在 definer 上下文里调用），规则是"能被 PostgREST 或客户端直接调到的函数必须走这一套"。
 
 ## 账号与会话（不用 Supabase Auth）
 
@@ -30,7 +30,7 @@ app-api（supabase/functions/app-api/index.ts）
 | 会话 | 登录成功由函数生成 32 字节随机令牌，浏览器拿到原文，库里只存 **SHA-256 摘要**（`app_sessions.token_hash`），有效期 30 天 |
 | 携带 | 请求头 `x-app-session`（或 `Authorization: Bearer`），每次请求刷新 `last_seen_at` |
 | 失效 | 退出登录删除该行；管理员停用成员时 `app_set_member_roles` 直接删掉该用户所有会话 |
-| 首个管理员 | 第一个注册的用户自动获得 `admin` 角色（`app_create_user` 里的 `first_user` 分支）；注册开关关掉后只能由管理员建号 |
+| 首个管理员 | **没有"首个注册用户自动成为管理员"这回事**（早期版本有，已被 `admin-settings-audit.sql` 重写的 `app_create_user` 去掉）。空库上线时按 [database-migrations.md](database-migrations.md#执行顺序空库从零建起) 在第三步手工建内置 `admin` 账号并给它 `admin` 角色；之后注册开关关掉就只能由管理员建号 |
 
 > 为什么不用 Supabase Auth：见 [decisions.md](decisions.md) 的「自研账号体系，不用 Supabase Auth」。
 
@@ -42,7 +42,7 @@ app-api（supabase/functions/app-api/index.ts）
 2. `app-api` 的 `requireRole(actor, role)` / `hasRole(actor, role)` —— 决定这个 HTTP 动作能不能进来。
 3. 数据库 `private.app_user_has_role(user, role)` —— 最终裁决，写在每个业务函数的第一行。
 
-内置超级管理员（用户名恰好是 `admin` 且拥有 `admin` 角色）可以在第 2、3 层跨身份处理财委/主席/付款登记；**普通管理员不等于流程身份**。细节见 [roles-and-permissions.md](roles-and-permissions.md)。
+内置超级管理员（用户名恰好是 `admin` 且拥有 `admin` 角色）可以在第 2、3 层跨身份处理财委/主席/付款登记；**普通管理员不等于流程身份**。细节见 [workflow.md](workflow.md#身份与权限)。
 
 ## 文件与私有存储
 

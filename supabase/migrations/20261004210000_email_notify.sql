@@ -126,6 +126,27 @@ create index if not exists notifications_application_idx on public.notifications
 alter table public.notifications enable row level security;
 revoke all on table public.notifications from public, anon, authenticated;
 
+-- 状态 ↔ 提醒事件的映射在数据库里只写一份，入队触发器与投递前复核都问它：
+-- 触发器问“这个新状态该发哪类提醒”，投递前复核问“这封提醒对应的待办现在是否仍然成立”
+-- （app-api 侧另有一份 JS 副本用于发送前的兜底判断，测试逐项比对两份清单）。
+-- 写成 VALUES 表而不是 CASE，是因为 app-api 的 NOTIFY_EVENT_STATUS 本来就是这张两列表，
+-- 形状一致时“两份清单错位”在测试里读起来更直观；已撤回、草稿不在表里，永远不发。
+create or replace function private.app_notify_event_for_status(p_status text)
+returns text language sql immutable set search_path = public, pg_temp as $$
+  select m.event
+  from (values
+    ('finance_pending', '待财委审批'),
+    ('chair_pending', '待主席审批'),
+    ('changes_requested', '退回修改'),
+    ('payment_info_required', '待补充收款码'),
+    ('payment_pending', '待付款登记'),
+    ('rejected', '拒绝申请'),
+    ('paid', '已付款')
+  ) as m(status, event)
+  where m.status = p_status;
+$$;
+revoke all on function private.app_notify_event_for_status(text) from public, anon, authenticated;
+
 -- 状态变化、总开关与逐类开关在同一个事务里决定是否入队；已撤回、草稿不在映射表里，永远不发。
 -- 五类待办发给对应处理身份的成员（并排除申请人本人）或申请人本人；拒绝申请、已付款两个结果通知只发给申请人本人。
 -- 收件人一律通过 private.app_user_has_role 判定，这样身份含义变化（例如付款登记视同财委）不需要改动这里。
@@ -147,15 +168,7 @@ begin
        and event = '待付款登记' and status <> 'cancelled';
   end if;
 
-  target_event := case new.status
-    when 'finance_pending' then '待财委审批'
-    when 'chair_pending' then '待主席审批'
-    when 'changes_requested' then '退回修改'
-    when 'payment_info_required' then '待补充收款码'
-    when 'payment_pending' then '待付款登记'
-    when 'rejected' then '拒绝申请'
-    when 'paid' then '已付款'
-    else null end;
+  target_event := private.app_notify_event_for_status(new.status);
   if target_event is null then return null; end if;
   -- 总开关与该类型的勾选都要为真；关闭期间发生的变化不补发（管理员重新打开后只管之后的状态变化）。
   if not exists(select 1 from public.settings where id = 1 and email_notify_enabled and target_event = any(email_notify_events)) then return null; end if;
@@ -310,26 +323,69 @@ begin
   return jsonb_build_object('discarded', discarded, 'cancelled', cancelled, 'claimed', taken, 'rows', claimed);
 end $$;
 
--- 投递前最后一次复核：app-api 在每个发送组之前调用，只返回"不该再发"的行与原因（没有出现在结果里的就可以发）。
--- 领取之后到真正投递之间还隔着几秒到几十秒（一轮 100 封、每组 5 封），管理员撤角色或关类型就发生在这个窗口里；
--- 判定继续复用 private.app_notify_recipient_allowed 与 settings.email_notify_events，不在客户端重写规则。
--- 只看"逐类开关"，不看总开关：总开关是暂停（本轮已领取的行按组发完、下一轮直接返回 skipped），
--- 不是"作废"——把它混进来的话，关掉总开关会给出"已关闭「X」提醒"这种与实际不符的作废原因。
-create or replace function public.app_notify_blocked_rows(p_ids bigint[])
+-- 投递前最后一次复核（PR #19 终审 P2 起改为“白名单”契约）：app-api 在每个发送组之前调用，
+-- 请求里的每个 id 都必须拿到明确的 'send' 判定，handler 才会把这封交给邮件服务。
+--
+-- 旧版是 blocked 契约：只返回"不该再发"的行，handler 把"没出现在结果里"当成放行。于是领取之后被工作流
+-- 改成 cancelled 的行（例如移除收款码会把「待付款登记」作废）从结果里消失，反而被当成合格行寄出——
+-- 缺席不能作为放行证据。现在三种判定都由数据库给出，客户端不重写规则：
+--   send   —— 仍属于本次领取、租约未过期，且申请版本/状态、收件人身份、逐类开关全部仍然成立：唯一放行值。
+--   cancel —— 仍属于本次领取，但按数据库当前事实不该再发（类型被关、身份失效、申请已升版本或已离开该状态）：
+--             handler 就地写 cancelled 并计「已作废」。
+--   skip   —— 已经不属于本次领取（状态不是 sending、批次号不是本批、租约已过期）：不投递，复核也不会把它改成
+--             cancelled/failed。它可能刚被工作流作废、被别的批次接手或正在等租约恢复，写回只会破坏别的路径的
+--             记账。（handler 收尾退回队列时仍会碰"本批持有、只是租约已过期"的那种 skip——那是既有的中断恢复
+--             语义；其余 skip 在写回条件上必然不命中。）
+-- 只逐项检查请求里给出的 id（不按表扫）；left join 容忍申请已被删除（行会随级联一起消失，
+-- 那种情况下 id 根本不出现在返回结果里，handler 按“没有明确放行”处理）。
+-- 总开关（email_notify_enabled）不参与：它是暂停（下一轮直接 skipped），不是作废理由。
+-- 旧版函数按函数名整体删除，避免库里留下两个复核入口。
+do $$
+declare item record;
+begin
+  for item in
+    select p.oid, p.proname from pg_proc p
+    join pg_namespace n on n.oid = p.pronamespace
+    where n.nspname = 'public' and p.proname = 'app_notify_blocked_rows'
+  loop
+    execute format('drop function public.%I(%s)', item.proname, pg_get_function_identity_arguments(item.oid));
+  end loop;
+end $$;
+create or replace function public.app_notify_verify_rows(p_claim_id uuid, p_ids bigint[])
 returns jsonb language sql stable security definer set search_path = public, private, pg_temp as $$
-  select coalesce(jsonb_agg(jsonb_build_object('id', n.id, 'reason', blocked.reason) order by n.id), '[]'::jsonb)
-  from public.notifications n
-  cross join lateral (
-    select case
-      when not exists(select 1 from public.settings s where s.id = 1 and n.event = any(s.email_notify_events))
-        then '管理员已关闭「' || n.event || '」提醒，本封已作废'
-      when not private.app_notify_recipient_allowed(n.recipient_user_id, n.event)
-        then '收件人已不具备该待办的处理身份，提醒已作废'
-      else null end as reason
-  ) blocked
-  where n.id = any(coalesce(p_ids, '{}'::bigint[]))
-    and n.status = 'sending'
-    and blocked.reason is not null;
+  select coalesce(jsonb_agg(jsonb_build_object('id', v.id, 'verdict', v.verdict, 'reason', v.reason) order by v.id), '[]'::jsonb)
+  from (
+    select n.id,
+           case
+             when p_claim_id is null or n.status <> 'sending' or n.claim_id is distinct from p_claim_id or n.lease_expires_at <= now()
+               then 'skip'
+             when not exists(select 1 from public.settings s where s.id = 1 and n.event = any(s.email_notify_events))
+               then 'cancel'
+             when not private.app_notify_recipient_allowed(n.recipient_user_id, n.event)
+               then 'cancel'
+             when a.id is null or a.version is distinct from n.application_version
+               then 'cancel'
+             when n.event is distinct from private.app_notify_event_for_status(a.status)
+               then 'cancel'
+             else 'send'
+           end as verdict,
+           case
+             when p_claim_id is null or n.status <> 'sending' or n.claim_id is distinct from p_claim_id or n.lease_expires_at <= now()
+               then '该行已不属于本次领取（状态、批次或租约已变化），不再投递'
+             when not exists(select 1 from public.settings s where s.id = 1 and n.event = any(s.email_notify_events))
+               then '管理员已关闭「' || n.event || '」提醒，本封已作废'
+             when not private.app_notify_recipient_allowed(n.recipient_user_id, n.event)
+               then '收件人已不具备该待办的处理身份，提醒已作废'
+             when a.id is null or a.version is distinct from n.application_version
+               then '申请已重新提交（版本 ' || n.application_version || ' → ' || coalesce(a.version::text, '已删除') || '），提醒已作废'
+             when n.event is distinct from private.app_notify_event_for_status(a.status)
+               then '申请状态已不再是「' || n.event || '」对应的状态（当前 ' || a.status || '），提醒已作废'
+             else ''
+           end as reason
+    from public.notifications n
+    left join public.applications a on a.id = n.application_id
+    where n.id = any(coalesce(p_ids, '{}'::bigint[]))
+  ) v;
 $$;
 
 -- 永久失败（尝试次数用满）的提醒在配置好邮件服务后可以重新排队；保留 last_error 便于管理员看原因。
@@ -449,12 +505,12 @@ end $$;
 revoke all on function public.app_bind_email(uuid, uuid, text) from public, anon, authenticated;
 revoke all on function public.app_update_email_notify(uuid, boolean, text[]) from public, anon, authenticated;
 revoke all on function public.app_claim_notifications(uuid, integer, integer, integer, integer) from public, anon, authenticated;
-revoke all on function public.app_notify_blocked_rows(bigint[]) from public, anon, authenticated;
+revoke all on function public.app_notify_verify_rows(uuid, bigint[]) from public, anon, authenticated;
 revoke all on function public.app_reset_failed_notifications(uuid) from public, anon, authenticated;
 revoke all on function public.app_admin_create_user(uuid, text, text, text, text, text[], text) from public, anon, authenticated;
 grant execute on function public.app_bind_email(uuid, uuid, text) to service_role;
 grant execute on function public.app_update_email_notify(uuid, boolean, text[]) to service_role;
 grant execute on function public.app_claim_notifications(uuid, integer, integer, integer, integer) to service_role;
-grant execute on function public.app_notify_blocked_rows(bigint[]) to service_role;
+grant execute on function public.app_notify_verify_rows(uuid, bigint[]) to service_role;
 grant execute on function public.app_reset_failed_notifications(uuid) to service_role;
 grant execute on function public.app_admin_create_user(uuid, text, text, text, text, text[], text) to service_role;

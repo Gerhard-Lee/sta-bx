@@ -6,7 +6,7 @@ import { ROLE_LABEL } from '../src/reporting.js';
 
 const read = (path) => readFileSync(path, 'utf8');
 const doc = (name) => read(`docs/${name}`);
-const DOC_FILES = ['README.md', 'architecture.md', 'data-model.md', 'workflow.md', 'roles-and-permissions.md', 'notifications.md', 'database-migrations.md', 'testing.md', 'deployment.md', 'decisions.md', 'known-issues.md'];
+const DOC_FILES = ['README.md', 'architecture.md', 'data-model.md', 'workflow.md', 'notifications.md', 'database-migrations.md', 'testing.md', 'deployment.md', 'decisions.md', 'known-issues.md'];
 
 test('文档集完整，索引里的每个链接都指向存在的文件', () => {
   for (const name of DOC_FILES) assert.ok(existsSync(`docs/${name}`), `缺少 docs/${name}`);
@@ -51,12 +51,12 @@ test('通知文档的事件清单与代码里的完全一致，并说明哪些�
   // 七类里哪些默认开、哪些默认关，以及"交给管理员配置"这件事必须在文档里说清。
   for (const needed of ['settings.email_notify_events', '默认', '管理员']) assert.ok(text.includes(needed), `通知文档缺少配置说明：${needed}`);
 });
-test('权限文档覆盖界面能分配的身份，并点出无法分配的 cashier', () => {
-  const text = doc('roles-and-permissions.md');
-  for (const [role, label] of Object.entries(ROLE_LABEL)) assert.ok(text.includes(role) && text.includes(label), `权限文档缺少身份 ${role}/${label}`);
+test('流程文档覆盖界面能分配的身份，并说明 cashier 是派生能力', () => {
+  const text = doc('workflow.md');
+  for (const [role, label] of Object.entries(ROLE_LABEL)) assert.ok(text.includes(role) && text.includes(label), `流程文档缺少身份 ${role}/${label}`);
   assert.ok(text.includes('cashier'));
-  assert.ok(text.includes('app_user_has_role'), '权限文档必须说明数据库层判定入口');
-  assert.ok(text.includes('不能处理自己'), '权限文档必须写明申请人不能处理自己的申请');
+  assert.ok(text.includes('app_user_has_role'), '流程文档必须说明数据库层判定入口');
+  assert.ok(text.includes('不能处理自己'), '流程文档必须写明申请人不能处理自己的申请');
 });
 test('迁移文档列出全部现存迁移与散装 SQL', () => {
   const text = doc('database-migrations.md');
@@ -81,11 +81,12 @@ test('部署文档给出凭据归属，并承诺仓库零密钥', () => {
 });
 test('决策与已知问题不是空壳', () => {
   const decisions = doc('decisions.md');
-  assert.ok((decisions.match(/^## /gm) ?? []).length >= 10, '决策记录太少');
+  // 只留"有内容"的下限，不把篇数/章节数当目标：文档该被压缩时压缩，测试不该逼着保留重复章节。
+  assert.ok((decisions.match(/^## /gm) ?? []).length >= 8, '决策记录太少');
   for (const topic of ['自研账号', '唯一数据入口', 'PL/pgSQL', 'rule_threshold', '租约', 'at-least-once', '中文', 'pg_cron', 'fail-fast']) assert.ok(decisions.includes(topic), `决策记录缺少：${topic}`);
   const issues = doc('known-issues.md');
-  assert.ok((issues.match(/^## \d+ /gm) ?? []).length >= 8, '已知问题太少');
-  for (const topic of ['cashier', 'verify-react-regressions', 'profiles.length', '绑定邮箱', 'CI', 'POSIX sh']) assert.ok(issues.includes(topic), `已知问题缺少：${topic}`);
+  assert.ok((issues.match(/^## \d+ /gm) ?? []).length >= 5, '已知问题太少');
+  for (const topic of ['verify-react-regressions', 'profiles.length', '绑定邮箱', 'CI', 'POSIX sh']) assert.ok(issues.includes(topic), `已知问题缺少：${topic}`);
 });
 test('架构文档描述的分层与真实代码一致', () => {
   const text = doc('architecture.md');

@@ -64,12 +64,15 @@ test('邮件通知总开关默认关闭，逐类勾选默认只开五类待办',
 test('七类提醒与四处清单一致：待办五类 + 拒绝申请/已付款两个结果通知', () => {
   assert.deepEqual(NOTIFY_EVENTS, ['待财委审批', '待主席审批', '退回修改', '待补充收款码', '待付款登记', '拒绝申请', '已付款']);
   assert.deepEqual(NOTIFY_EVENTS.filter((event) => !NOTIFY_DEFAULT_EVENTS.includes(event)), ['拒绝申请', '已付款']);
-  const mapping = slice(migration, 'target_event := case new.status', 'else null end');
-  assert.equal((mapping.match(/when '/g) ?? []).length, 7);
-  // 已撤回、草稿永远不发：既不是待办也不是结果。
-  for (const never of ['cancelled', 'draft']) assert.equal(new RegExp(`when '${never}' then`).test(migration), false, `${never} 不应该映射成邮件事件`);
-  const sqlEvents = [...migration.matchAll(/when '(?:finance_pending|chair_pending|changes_requested|payment_info_required|payment_pending|rejected|paid)' then '([^']+)'/g)].map((m) => m[1]);
-  assert.deepEqual(sqlEvents, NOTIFY_EVENTS);
+  // 状态 → 事件的映射在数据库里只有一份（private.app_notify_event_for_status 的 VALUES 表），
+  // 入队触发器与投递前复核都引用它，避免同一张表写两遍后错位。
+  const mapping = slice(migration, 'private.app_notify_event_for_status(p_status text)', 'where m.status = p_status');
+  const sqlPairs = [...mapping.matchAll(/\('(\w+)', '([^']+)'\)/g)].map((m) => [m[2], m[1]]);
+  assert.equal(sqlPairs.length, 7);
+  assert.deepEqual(sqlPairs.map(([event]) => event), NOTIFY_EVENTS);
+  assert.match(migration, /target_event := private\.app_notify_event_for_status\(new\.status\)/);
+  // 已撤回、草稿永远不发：既不是待办也不是结果（根本不在映射表里）。
+  for (const never of ['cancelled', 'draft']) assert.equal(new RegExp(`\\('${never}', `).test(mapping), false, `${never} 不应该映射成邮件事件`);
   const apiSlice = slice(api, 'const NOTIFY_EVENTS', 'const STATUS_LABELS');
   const apiEvents = [...apiSlice.matchAll(/'([^']+)': '/g)].map((m) => m[1]);
   assert.deepEqual(apiEvents, NOTIFY_EVENTS);
@@ -254,8 +257,8 @@ test('定时入口只放行消费队列，密钥不正确就拒绝，且不要�
 test('开关关闭优先于密钥检查：定时任务不会因为没配邮件服务而反复失败刷日志', () => {
   const drain = slice(api, 'const drainNotifications = async', "const { count: pendingLeft");
   assert.ok(drain.indexOf('if (!settingsRow.email_notify_enabled)') < drain.indexOf('if (!apiUrl || !apiKey || !emailFrom)'));
-  assert.match(drain, /if \(!settingsRow\.email_notify_enabled\) return ok\(\{ sent: 0, failed: 0, retried: 0, cancelled: 0, deferred: 0, discarded: 0, skipped: true/);
-  assert.match(drain, /if \(actorId === null\) return ok\(\{[\s\S]{0,160}misconfigured: true/);
+  assert.match(drain, /if \(!settingsRow\.email_notify_enabled\) return ok\(\{ sent: 0, failed: 0, retried: 0, cancelled: 0, deferred: 0, discarded: 0, stale: 0, skipped: true/);
+  assert.match(drain, /if \(actorId === null\) return ok\(\{[\s\S]{0,200}misconfigured: true/);
   assert.match(drain, /throw new HttpError\('邮件服务尚未配置，请项目负责人为 app-api 配置 EMAIL_API_URL、EMAIL_API_KEY 与 EMAIL_FROM。', 503\)/);
   assert.match(drain, /AbortSignal\.timeout\(NOTIFY_SEND_TIMEOUT_MS\)/);
   assert.match(drain, /while \(rounds < NOTIFY_ROUNDS && !stop\)/);
@@ -278,25 +281,51 @@ test('一轮消费有时间预算：每一组之前判断"够不够跑完这一�
   assert.match(drain, /deferred \+= results\.filter\(Boolean\)\.length/);
   assert.match(drain, /本轮时间用尽，已退回队列/);
 });
-test('投递前复核每个发送组：领取之后被撤身份或关类型的行就地作废，不再寄出', () => {
+test('投递前复核每个发送组：白名单契约——只有明确判 send 的行才投递', () => {
   const drain = slice(api, 'const drainNotifications = async', "const { count: pendingLeft");
-  // handler 侧：每组之前调用数据库复核，被挡下的行作废并计进"已作废"，合格的行才进入发送。
+  // handler 侧：每组之前调用数据库复核，按 verdict 行事——send 才投递、cancel 就地作废、skip/缺席一律不发也不改状态。
   assert.match(drain, /const recheckGroup = async \(group: Record<string, any>\[\]\) => \{/);
-  assert.match(drain, /blocked = await rpc\('app_notify_blocked_rows', \{ p_ids: group\.map\(\(note\) => note\.id\) \}\)/);
+  assert.match(drain, /verdicts = await rpc\('app_notify_verify_rows', \{ p_claim_id: claimId, p_ids: group\.map\(\(note\) => note\.id\) \}\)/);
+  assert.match(drain, /const verdict = verdictById\.get\(Number\(note\.id\)\)/);
+  assert.match(drain, /if \(verdict\?\.verdict !== 'send'\) \{/);
+  assert.match(drain, /const reason = verdict\.reason \|\| '投递前复核未通过，提醒已作废'/);
   assert.match(drain, /if \(await settle\(note, \{ status: 'cancelled', claim_id: null, last_error: reason\.slice\(0, 300\) \}\)\) cancelled\+\+/);
+  // skip/缺席分支只能计数，不能写回任何状态：旧版就是在这里把"没有判定"当成了放行。
+  // （收尾退回队列对"本批持有、仅租约过期"的 skip 仍生效，那是既有中断恢复语义，不是复核写的。）
+  const skipBranch = drain.slice(drain.indexOf("if (verdict?.verdict !== 'send')"));
+  const skipElse = skipBranch.slice(skipBranch.indexOf('} else {'));
+  assert.match(skipElse.slice(0, 400), /stale\+\+/, 'skip/缺席的行应计进跳过数');
+  assert.equal(/settle\(/.test(skipElse.slice(0, skipElse.indexOf('stale++'))), false, 'skip/缺席的行不能被复核写回状态');
   assert.match(drain, /const group = await recheckGroup\(rows\.slice\(index, index \+ NOTIFY_CONCURRENCY\)\)/);
-  assert.match(drain, /if \(group\.length\) await Promise\.all\(group\.map\(sendOne\)\)/);
-  // 数据库侧：复核函数只返回"不该再发"的行与原因，判定复用身份函数与逐类开关。
-  assert.match(migration, /create or replace function public\.app_notify_blocked_rows\(p_ids bigint\[\]\)/);
-  assert.match(migration, /when not private\.app_notify_recipient_allowed\(n\.recipient_user_id, n\.event\)\s+then '收件人已不具备该待办的处理身份，提醒已作废'/);
-  assert.match(migration, /and n\.status = 'sending'\s+and blocked\.reason is not null/);
-  assert.match(migration, /revoke all on function public\.app_notify_blocked_rows\(bigint\[\]\) from public, anon, authenticated/);
-  assert.match(migration, /grant execute on function public\.app_notify_blocked_rows\(bigint\[\]\) to service_role/);
+  // 放行的行先按"当前邮箱"重读一次收件人（不能拿整批开始时的地址快照投递），再逐封发送；
+  // 重读失败与复核失败同一套降级策略：整组退回队列并收尾。
+  assert.match(drain, /const fresh = await admin\.from\('app_users'\)\.select\('id,email,active'\)\.in\('id', \[\.\.\.new Set\(group\.map\(\(note\) => note\.recipient_user_id\)\)\]\)/);
+  assert.match(drain, /if \(fresh\.error\) \{[\s\S]{0,400}status: 'pending', claim_id: null[\s\S]{0,200}stop = true/);
+  assert.match(drain, /await Promise\.all\(group\.map\(sendOne\)\)/);
+  // 数据库侧：请求里的每个 id 都必须拿到明确判定；非本次领取的行判 skip，而不是“从结果里消失”。
+  assert.match(migration, /create or replace function public\.app_notify_verify_rows\(p_claim_id uuid, p_ids bigint\[\]\)/);
+  // `p_claim_id is null` 也要判 skip：否则"行 claim_id 也是 NULL"时 is distinct from 为假、会被误判成 send。
+  assert.match(migration, /when p_claim_id is null or n\.status <> 'sending' or n\.claim_id is distinct from p_claim_id or n\.lease_expires_at <= now\(\)\s+then 'skip'/);
+  assert.match(migration, /when not private\.app_notify_recipient_allowed\(n\.recipient_user_id, n\.event\)\s+then 'cancel'/);
+  assert.match(migration, /when a\.id is null or a\.version is distinct from n\.application_version\s+then 'cancel'/);
+  assert.match(migration, /when n\.event is distinct from private\.app_notify_event_for_status\(a\.status\)\s+then 'cancel'/);
+  assert.match(migration, /else 'send'/);
+  assert.match(migration, /该行已不属于本次领取（状态、批次或租约已变化），不再投递/);
+  // 旧 blocked 复核入口必须整体删除，不许在库里留下第二个复核函数（那正是“缺席即放行”的来源）。
+  assert.match(migration, /p\.proname = 'app_notify_blocked_rows'[\s\S]{0,120}drop function public\.%I\(%s\)/);
+  assert.equal(/\.rpc\(\s*'app_notify_blocked_rows'/.test(api), false, 'handler 不应再调用旧 blocked 契约（注释里提到历史函数名不算）');
+  assert.match(migration, /revoke all on function public\.app_notify_verify_rows\(uuid, bigint\[\]\) from public, anon, authenticated/);
+  assert.match(migration, /grant execute on function public\.app_notify_verify_rows\(uuid, bigint\[\]\) to service_role/);
   // 投递前复核只看逐类开关，不看总开关：总开关是暂停（下一轮 skipped），不是"该类型被关闭"的作废理由。
-  assert.match(migration, /when not exists\(select 1 from public\.settings s where s\.id = 1 and n\.event = any\(s\.email_notify_events\)\)\s+then '管理员已关闭「' \|\| n\.event \|\| '」提醒，本封已作废'/);
-  assert.equal(/app_notify_blocked_rows[\s\S]{0,900}s\.email_notify_enabled/.test(migration), false, '投递前复核不应把总开关当成作废条件');
-  assert.match(verify, /领取后撤销身份的行应被投递前复核挡下/);
-  assert.match(verify, /身份仍有效的行不应被投递前复核挡下/);
+  assert.match(migration, /when not exists\(select 1 from public\.settings s where s\.id = 1 and n\.event = any\(s\.email_notify_events\)\)\s+then 'cancel'/);
+  const verifyFn = slice(migration, 'create or replace function public.app_notify_verify_rows', '-- 永久失败');
+  assert.equal(verifyFn.includes('email_notify_enabled'), false, '投递前复核不应把总开关当成作废条件');
+  assert.match(verify, /领取后撤销身份的行应被投递前复核判为 cancel/);
+  assert.match(verify, /身份仍有效的行应被投递前复核明确放行/);
+  assert.match(verify, /已被作废的提醒应判为 skip/);
+  assert.match(verify, /批次号不匹配的行应判为 skip/);
+  assert.match(verify, /租约已过期的行应判为 skip/);
+  assert.match(verify, /投递前复核不应改动已作废行的状态/);
 });
 test('提醒类型配置：逐类开关入库、非枚举值被拒、只有管理员能改、关闭后积压行作废', () => {
   assert.match(migration, /create or replace function public\.app_update_email_notify\(p_actor_id uuid, p_enabled boolean, p_events text\[\]\)/);
@@ -350,8 +379,9 @@ test('发送前复核状态：已经不处于待办状态的提醒改为作废�
   assert.match(sendOne, /const expectedStatus = NOTIFY_EVENT_STATUS\[note\.event\]/);
   assert.match(sendOne, /if \(expectedStatus && app\.status !== expectedStatus\)/);
   assert.match(sendOne, /status: 'cancelled', claim_id: null, last_error: `申请状态已变为「\$\{STATUS_LABELS\[app\.status\] \?\? app\.status\}」，提醒已作废`/);
-  // 事件与期望状态的映射必须和数据库触发器里的 CASE 分支一致。
-  const sqlMapping = [...migration.matchAll(/when '(\w+)' then '([^']+)'/g)].map((m) => [m[2], m[1]]);
+  // 事件与期望状态的映射必须和数据库里那份唯一的映射表一致。
+  const mapping = slice(migration, 'private.app_notify_event_for_status(p_status text)', 'where m.status = p_status');
+  const sqlMapping = [...mapping.matchAll(/\('(\w+)', '([^']+)'\)/g)].map((m) => [m[2], m[1]]);
   assert.deepEqual(NOTIFY_EVENT_STATUS_FROM_API(), sqlMapping);
 });
 test('邮件服务限频（429）不计入尝试次数，按 Retry-After 暂停本轮并退回其余行', () => {
@@ -394,9 +424,16 @@ test('写回失败不算已处理：计数只在写回成功后增加，行留�
     const gated = new RegExp(`if \\(await settle\\(note, \\{[\\s\\S]{0,220}?\\)\\) ${counter}`);
     assert.match(sendOne, gated, `${counter} 应该在写回成功后才计数`);
   }
-  // 退回步骤只统计写回成功的行。
-  assert.match(drain, /const results = await Promise\.all\(leftovers\.slice\(index, index \+ NOTIFY_CONCURRENCY\)\.map\(\(note\) => release\(note, message\)\)\)/);
+  // 退回步骤只统计写回成功的行，而且同一行只能计一次：被复核判 skip、收尾又退回成功的行，
+  // 计数要从「跳过」挪进「退回」，否则 6 行的队列会报出 7 个封数（运行时用例「复核跳过的行不再被重复计进
+  // 「本轮退回」：6 行提醒的封数必须对齐」盯着这条；审计文案也不能再声称"本轮均未投递"）。
+  assert.match(drain, /const group = leftovers\.slice\(index, index \+ NOTIFY_CONCURRENCY\)/);
+  assert.match(drain, /const results = await Promise\.all\(group\.map\(\(note\) => release\(note, message\)\)\)/);
   assert.match(drain, /deferred \+= results\.filter\(Boolean\)\.length/);
+  assert.match(drain, /const movedFromStale = results\.filter\(\(released, position\) => released && staleIds\.has\(Number\(group\[position\]\.id\)\)\)\.length/);
+  assert.match(drain, /stale -= movedFromStale/);
+  // 收尾文案区分"复核失败"与"时间用尽"：复核失败时预算根本没用到。
+  assert.match(drain, /recheckFailures > 0 \? '投递前复核失败，本轮未继续，已退回队列' : '本轮时间用尽，已退回队列'/);
   // 领取时把上一次的失败原因带回来，退回时不会把它冲掉。
   assert.match(migration, /'attempts', attempts, 'last_error', last_error\) order by created_at, id/);
 });
@@ -502,7 +539,7 @@ test('账户入口不再只叫修改密码', () => {
 test('新表和新函数延续最小权限：RLS 加 service_role 专属执行', () => {
   assert.match(migration, /alter table public\.notifications enable row level security/);
   assert.match(migration, /revoke all on table public\.notifications from public, anon, authenticated/);
-  for (const fn of ['app_bind_email(uuid, uuid, text)', 'app_update_email_notify(uuid, boolean, text[])', 'app_claim_notifications(uuid, integer, integer, integer, integer)', 'app_notify_blocked_rows(bigint[])', 'app_reset_failed_notifications(uuid)']) {
+  for (const fn of ['app_bind_email(uuid, uuid, text)', 'app_update_email_notify(uuid, boolean, text[])', 'app_claim_notifications(uuid, integer, integer, integer, integer)', 'app_notify_verify_rows(uuid, bigint[])', 'app_reset_failed_notifications(uuid)']) {
     assert.ok(migration.includes(`revoke all on function public.${fn} from public, anon, authenticated;`));
     assert.ok(migration.includes(`grant execute on function public.${fn} to service_role;`));
   }
@@ -524,8 +561,10 @@ test('迁移行为验证真的驱动状态变化，而不是只看对象是否�
     '移除收款码应作废本轮的待付款登记提醒',
     '重新提交收款码后应再次入队',
     '替别人绑定邮箱应被拒绝',
-    'public.app_notify_blocked_rows(array[blocked_row])',
-    '领取后撤销身份的行应被投递前复核挡下',
+    'public.app_notify_verify_rows(claim_1, array[blocked_row])',
+    '领取后撤销身份的行应被投递前复核判为 cancel',
+    '不存在的 id 不应出现在复核结果里（缺席不是放行）',
+    '缺少批次号时不应放行任何行',
     '关闭类型后已积压的该类提醒应作废',
     '打开结果通知后，拒绝申请应提醒申请人本人',
     '无身份成员不应收到任何提醒',

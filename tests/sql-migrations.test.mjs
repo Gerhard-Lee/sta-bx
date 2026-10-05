@@ -92,7 +92,7 @@ const MIGRATION_FILES = (() => {
   return names.map((name) => path.join(directory, name));
 })();
 
-// docs/database-migrations.md / README「执行顺序」的 4 份散装 SQL：早期在 Supabase Dashboard 的 SQL 编辑器里
+// docs/database-migrations.md「执行顺序」里的 4 份散装 SQL：早期在 Supabase Dashboard 的 SQL 编辑器里
 // 手工执行过、后来才补 verify 的历史遗留。它们全是 alter table / 建函数，针对的都是**已经存在**的表。
 const BULK_FILES = [
   path.join(SQL_ROOT, 'admin-settings-audit.sql'),
@@ -347,6 +347,48 @@ test('原样执行 20261004210000_email_notify.sql 不报错，且 name[] = text
   }
   assert.ok(oldFormError, '不转 text 的旧写法必须报错，否则本用例抓不到这个 bug');
   assert.match(oldFormError.message, /operator does not exist: name\[\] = text\[\]/);
+});
+
+test('升级路径：库里已有旧版 app_notify_blocked_rows 时，重跑迁移会删掉它并换成白名单复核', { timeout: TIMEOUT }, async () => {
+  const db = await bootstrap();
+
+  // 模拟"已经部署过旧版"的库：旧复核函数存在，并且按旧版那样只授权给 service_role。
+  await db.exec(`
+    create or replace function public.app_notify_blocked_rows(p_ids bigint[])
+    returns jsonb language sql stable as $$ select '[]'::jsonb $$;
+    revoke all on function public.app_notify_blocked_rows(bigint[]) from public, anon, authenticated;
+    grant execute on function public.app_notify_blocked_rows(bigint[]) to service_role;
+  `);
+  const before = await db.query("select to_regprocedure('public.app_notify_blocked_rows(bigint[])') is not null as present");
+  assert.equal(before.rows[0].present, true, '前置条件失败：旧函数应当已存在');
+
+  // 这个迁移在分支内被就地改写过，对"已经执行过旧版"的库必须仍然幂等：按函数名删旧重载、建新函数。
+  const migration = path.join(SQL_ROOT, 'migrations', '20261004210000_email_notify.sql');
+  await db.exec(read(migration));
+
+  const after = await db.query(`
+    select
+      to_regprocedure('public.app_notify_blocked_rows(bigint[])') is not null as old_present,
+      to_regprocedure('public.app_notify_verify_rows(uuid,bigint[])') is not null as new_present,
+      (select count(*) from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+        where n.nspname = 'public' and p.proname = 'app_notify_verify_rows') as overloads,
+      has_function_privilege('service_role', 'public.app_notify_verify_rows(uuid,bigint[])', 'EXECUTE') as service_role_ok,
+      has_function_privilege('authenticated', 'public.app_notify_verify_rows(uuid,bigint[])', 'EXECUTE') as authenticated_ok,
+      has_function_privilege('anon', 'public.app_notify_verify_rows(uuid,bigint[])', 'EXECUTE') as anon_ok
+  `);
+  const row = after.rows[0];
+  assert.equal(row.old_present, false, '旧的 app_notify_blocked_rows 必须被按函数名整体删除');
+  assert.equal(row.new_present, true, '新的白名单复核函数必须存在');
+  assert.equal(Number(row.overloads), 1, '复核函数不应留下多个重载');
+  assert.equal(row.service_role_ok, true, 'service_role 应能执行复核函数');
+  assert.equal(row.authenticated_ok, false, 'authenticated 不应能执行复核函数');
+  assert.equal(row.anon_ok, false, 'anon 不应能执行复核函数');
+
+  // 升级后复核照常可用：空 ids 与"缺少批次号"都必须返回空结果（缺判定 = 不放行）。
+  const empty = await db.query("select public.app_notify_verify_rows(null, '{}'::bigint[]) = '[]'::jsonb as ok");
+  assert.equal(empty.rows[0].ok, true);
+  const noClaim = await db.query("select public.app_notify_verify_rows(null, array[9223372036854775806::bigint]) = '[]'::jsonb as ok");
+  assert.equal(noClaim.rows[0].ok, true, '缺少批次号时不应返回任何放行判定');
 });
 
 test('verify 脚本真的驱动了数据变化：admin 前置账号由仓库函数建出且内置账号受保护', { timeout: TIMEOUT }, async () => {

@@ -10,6 +10,7 @@ const pkg = JSON.parse(source('deploy/mail-relay/package.json'));
 const override = source('deploy/docker-compose.override.yml');
 const secrets = source('deploy/secrets.env.example');
 const drain = source('deploy/drain.sh');
+const drainEnv = source('deploy/drain.env.example');
 const cron = source('deploy/stabx-notify.cron');
 const check = source('deploy/check.sh');
 const guide = source('deploy/README.md');
@@ -62,11 +63,21 @@ test('compose 覆盖：中继只在容器网内，数据库端口收回本机，
   assert.equal(/Bearer\s+[A-Za-z0-9_-]{16,}/.test(override), false, '覆盖文件里不写真密钥');
 });
 test('密钥模板只留占位符，并说明两个 token 的用途', () => {
-  assert.match(secrets, /SMTP_PASS=在这里填/);
-  assert.match(secrets, /EMAIL_RELAY_TOKEN=换成随机串/);
-  assert.match(secrets, /CRON_SECRET=换成随机串/);
-  assert.match(secrets, /RELAY_RATE_PER_MINUTE=12/);
+  assert.match(secrets, /SMTP_PASS="在这里填/);
+  assert.match(secrets, /EMAIL_RELAY_TOKEN="换成随机串"/);
+  assert.match(secrets, /CRON_SECRET="换成随机串/);
+  assert.match(secrets, /RELAY_RATE_PER_MINUTE="12"/);
   assert.equal(/[A-Za-z0-9]{28,}/.test(secrets), false, '模板里不能出现像真密钥的长串');
+  // 值一律加引号：两个模板都会被脚本直接 `.` source（check.sh 读 .env、drain.sh 读 /etc/stabx-notify.env），
+  // 未加引号的值一旦含空格或 <...>，会被 shell 拆成"赋值 + 命令"或当成重定向。`sh -n` 抓不到这类问题
+  // （它是执行期语义），所以用这条断言把两个模板一起钉住。
+  for (const [name, text] of [['secrets.env.example', secrets], ['drain.env.example', drainEnv]]) {
+    for (const line of text.split('\n')) {
+      const match = line.match(/^([A-Z_]+)=(.*)$/);
+      if (!match) continue;
+      assert.match(match[2], /^".*"$/, `${name} 里 ${match[1]} 的值必须用双引号包住`);
+    }
+  }
 });
 test('定时消费走主机 cron：带 x-app-cron、有超时、凭据不落脚本', () => {
   assert.match(drain, /set -eu/);
@@ -86,14 +97,14 @@ test('curl 超时必须大于函数一轮的消费预算，否则客户端先断
   };
   const budgetSeconds = NOTIFY_QUEUE.maxRuntimeMs / 1000;
   assert.ok(seconds(drain, /STABX_NOTIFY_TIMEOUT:-(\d+)/) > budgetSeconds, 'drain.sh 的默认超时必须大于 NOTIFY_MAX_RUNTIME_MS');
-  assert.ok(seconds(source('deploy/drain.env.example'), /STABX_NOTIFY_TIMEOUT=(\d+)/) > budgetSeconds, '模板里的超时必须大于 NOTIFY_MAX_RUNTIME_MS');
+  assert.ok(seconds(drainEnv, /STABX_NOTIFY_TIMEOUT="?(\d+)"?/) > budgetSeconds, '模板里的超时必须大于 NOTIFY_MAX_RUNTIME_MS');
   assert.match(source('deploy/README.md'), /必须\*\*大于\*\*函数侧一轮消费的预算/);
   // 托管免费方案的墙钟与 idle timeout 都是 150 秒：默认预算必须留在其内，自托管覆盖也不能超过 curl 超时。
   assert.ok(NOTIFY_QUEUE.maxRuntimeMs < 150000, '默认预算必须在免费方案 150 秒墙钟之内');
   const composeBudget = seconds(override, /NOTIFY_MAX_RUNTIME_MS:-(\d+)/);
   assert.ok(composeBudget > NOTIFY_QUEUE.maxRuntimeMs, '自托管覆盖的预算应当大于托管默认值');
   assert.ok(seconds(drain, /STABX_NOTIFY_TIMEOUT:-(\d+)/) > composeBudget / 1000, 'drain.sh 的超时必须大于自托管覆盖里的预算');
-  assert.ok(seconds(source('deploy/drain.env.example'), /STABX_NOTIFY_TIMEOUT=(\d+)/) > composeBudget / 1000, 'drain.env.example 的超时也必须大于自托管覆盖里的预算');
+  assert.ok(seconds(drainEnv, /STABX_NOTIFY_TIMEOUT="?(\d+)"?/) > composeBudget / 1000, 'drain.env.example 的超时也必须大于自托管覆盖里的预算');
   // pg_net 的 timeout_milliseconds 现在真的生效（官方文档 default 2000 毫秒）：定时 SQL 必须显式传，
   // 而且要大于函数侧一轮预算，否则一轮消费几秒就被掐断、剩余行卡在"发送中"。
   const cronSql = source('supabase/migrations/20261005140000_email_notify_cron.sql');
@@ -110,8 +121,9 @@ test('自检脚本覆盖六层，且失败会让退出码非 0', () => {
 test('部署说明给出三种摆法与“备案只关乎对外网站”的结论', () => {
   for (const needed of ['云 Supabase + HTTP 邮件 API', '全栈自托管 + QQ 授权码', '云 Supabase + QQ 授权码', '备案', 'Docker Compose **≥ 2.24**', 'pg_dump', 'smtpdm.aliyun.com']) assert.ok(guide.includes(needed), `部署说明缺少：${needed}`);
   // 口径必须准确：官方限制只禁 25/587，465 可用但不被承诺——中继是工程取舍，不是物理不可能。
-  assert.match(guide, /465 实测可用但不被承诺/);
-  assert.match(guide, /25\/587/);
+  // 详细依据（官方 Limits 链接、社区实测）在 deployment.md，deploy/README 只留结论。
+  assert.match(guide, /465[^\n]*未承诺/);
+  assert.ok(source('docs/deployment.md').includes('`25`/`587`'), 'deployment.md 必须写明官方出站限制只列 25/587');
 });
 test('部署脚本与 compose 必须是 LF：Windows 上 checkout 后拷到 Linux 执行不能被回车符破坏', () => {
   const attributes = source('.gitattributes');

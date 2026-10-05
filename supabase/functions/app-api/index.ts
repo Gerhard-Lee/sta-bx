@@ -20,7 +20,8 @@ function createAdmin(req: Request, requestId: string, action = '', actorId = '')
 }
 type AdminClient = ReturnType<typeof createAdmin>
 
-// 事件名必须与迁移 notifications.event 的 check 约束、settings.email_notify_events 的白名单和触发器 CASE 分支保持一致。
+// 事件名必须与迁移 notifications.event 的 check 约束、settings.email_notify_events 的白名单和
+// private.app_notify_event_for_status 的状态映射保持一致（测试逐项比对两处清单）。
 // 五类"需要有人动手"的待办发给对应身份的成员或申请人本人；拒绝申请、已付款是结果通知，只发给申请人本人，
 // 默认不在 settings.email_notify_events 里（管理员可在设置里打开）。已撤回、草稿不发。
 const NOTIFY_EVENTS: Record<string, string> = {
@@ -246,11 +247,11 @@ async function handle(req: Request) {
     const { data: settingsRow, error: settingsError } = await admin.from('settings').select('email_notify_enabled,email_notify_events').eq('id', 1).single()
     if (settingsError) throw new Error('通知设置读取失败。')
     // 开关优先于密钥：关闭时定时任务不应该因为没配邮件服务而反复失败刷日志。
-    if (!settingsRow.email_notify_enabled) return ok({ sent: 0, failed: 0, retried: 0, cancelled: 0, deferred: 0, discarded: 0, skipped: true, rounds: 0, pending: 0, message: '总开关关闭，未发送邮件。' })
+    if (!settingsRow.email_notify_enabled) return ok({ sent: 0, failed: 0, retried: 0, cancelled: 0, deferred: 0, discarded: 0, stale: 0, skipped: true, rounds: 0, pending: 0, message: '总开关关闭，未发送邮件。' })
     // 逐类开关由数据库在领取时执行（关掉的类型就地作废）；这里只记一份，用于审计与日志。
     const enabledEvents: string[] = Array.isArray(settingsRow.email_notify_events) ? settingsRow.email_notify_events : []
     if (!apiUrl || !apiKey || !emailFrom) {
-      if (actorId === null) return ok({ sent: 0, failed: 0, retried: 0, cancelled: 0, deferred: 0, discarded: 0, misconfigured: true, rounds: 0, pending: 0, message: '邮件服务尚未配置，本轮未发送。' })
+      if (actorId === null) return ok({ sent: 0, failed: 0, retried: 0, cancelled: 0, deferred: 0, discarded: 0, stale: 0, misconfigured: true, rounds: 0, pending: 0, message: '邮件服务尚未配置，本轮未发送。' })
       throw new HttpError('邮件服务尚未配置，请项目负责人为 app-api 配置 EMAIL_API_URL、EMAIL_API_KEY 与 EMAIL_FROM。', 503)
     }
     let sent = 0
@@ -259,6 +260,10 @@ async function handle(req: Request) {
     let cancelled = 0
     let deferred = 0
     let discarded = 0
+    let stale = 0
+    // 被复核判 skip 的具体行：收尾退回队列时要把它们从「跳过」挪进「退回」，
+    // 否则同一行会被计两次（审计里的封数与队列行数对不上）。
+    const staleIds = new Set<number>()
     let recheckFailures = 0
     let rounds = 0
     const startedAt = Date.now()
@@ -305,18 +310,23 @@ async function handle(req: Request) {
         next_attempt_at: new Date(Date.now() + throttleWait * 1000).toISOString(),
         last_error: note.last_error || message,
       })
-      // 投递前最后一次复核（审查 P1）：领取之后到真正投递之间还隔着几秒到几十秒——一轮最多 100 封、
-      // 每组 5 封并发，后面的行可能等很久。管理员撤角色或关类型就发生在这个窗口里，而入库时的判定已经过期。
-      // 复核交给数据库（private.app_user_has_role + settings.email_notify_events），客户端不重写规则；
-      // 只返回"不该再发"的行与原因，被挡下的就地作废，不进入发送。
+      // 投递前最后一次复核（审查 P1 + 终审 P2）：领取之后到真正投递之间还隔着几秒到几十秒——一轮最多 100 封、
+      // 每组 5 封并发，后面的行可能等很久。管理员撤角色、关类型，或者工作流把这行作废（例如移除收款码会把
+      // 「待付款登记」作废）都发生在这个窗口里，而入库时与领取时的判定都已经过期。
+      // 复核交给数据库（身份 private.app_user_has_role + settings.email_notify_events + 申请版本/状态），
+      // 客户端不重写规则，并且按“白名单”契约执行：只有数据库明确判定 send 的行才进入投递。
+      // 结果缺席（行已被删除、不在本次领取里）与 skip 一律不放行——旧版把“没出现在结果里”当放行，
+      // 已被工作流作废的行反而会被寄出（PR #19 终审 P2：缺席不是放行证据）。
+      // skip 的行不投递也不改状态：它可能刚被工作流作废、被别的批次接手，写回只会破坏别的路径的记账；
+      // cancel 的行是“仍属于本批、但按当前事实不该再发”，就地写 cancelled 并计「已作废」。
       // 复核本身失败（PostgREST 暂时不可用、schema 缓存未刷新）不能让整轮崩掉：把这一组原样退回队列、
       // 记下原因并结束本轮——否则这一个 RPC 出错会让最多 100 行卡在“发送中”，5 轮之后按“连续未完成”
       // 全部转 failed，本来该发的提醒一封都发不出去，而且审计里什么也看不到。
       const recheckGroup = async (group: Record<string, any>[]) => {
         if (!group.length) return group
-        let blocked: unknown
+        let verdicts: unknown
         try {
-          blocked = await rpc('app_notify_blocked_rows', { p_ids: group.map((note) => note.id) })
+          verdicts = await rpc('app_notify_verify_rows', { p_claim_id: claimId, p_ids: group.map((note) => note.id) })
         } catch (error) {
           recheckFailures++
           console.error(`notify recheck failed: ${error instanceof Error ? error.message : 'unknown'}`)
@@ -325,16 +335,25 @@ async function handle(req: Request) {
           }
           return []
         }
-        // 出现在结果里就是"被挡下"：reason 缺失/为空只影响文案，不能把它当成放行（那是调用方契约的漏洞）。
-        const reasons = new Map<number, string>((Array.isArray(blocked) ? blocked : []).map((row: Record<string, any>) => [Number(row.id), String(row.reason ?? '') || '投递前复核未通过，提醒已作废']))
+        const verdictById = new Map<number, { verdict: string; reason: string }>((Array.isArray(verdicts) ? verdicts : [])
+          .map((row: Record<string, any>) => [Number(row.id), { verdict: String(row.verdict ?? ''), reason: String(row.reason ?? '') }]))
         const allowed: Record<string, any>[] = []
         for (const note of group) {
-          const reason = reasons.get(Number(note.id))
-          if (reason === undefined) {
-            allowed.push(note)
+          const verdict = verdictById.get(Number(note.id))
+          if (verdict?.verdict !== 'send') {
+            if (verdict?.verdict === 'cancel') {
+              const reason = verdict.reason || '投递前复核未通过，提醒已作废'
+              if (await settle(note, { status: 'cancelled', claim_id: null, last_error: reason.slice(0, 300) })) cancelled++
+            } else {
+              // 没有判定（行已消失/不在本次领取）或明确 skip：不投递，也不由复核把它改成 cancelled/failed。
+              // 收尾退回队列时仍会碰其中"本批持有、只是租约已过期"的那种 skip——那是既有的中断恢复语义；
+              // 已作废、已换批次的行在 settle 的 claim_id/status 条件上必然写不中，不会被改动。
+              stale++
+              staleIds.add(Number(note.id))
+            }
             continue
           }
-          if (await settle(note, { status: 'cancelled', claim_id: null, last_error: reason.slice(0, 300) })) cancelled++
+          allowed.push(note)
         }
         return allowed
       }
@@ -342,15 +361,15 @@ async function handle(req: Request) {
         const app = apps.get(note.application_id)
         const recipient = users.get(note.recipient_user_id)
         if (!app) {
-          if (await settle(note, { status: 'failed', attempts: note.attempts + 1, last_error: '申请已不存在' })) failed++
+          if (await settle(note, { status: 'failed', attempts: note.attempts + 1, claim_id: null, last_error: '申请已不存在' })) failed++
           return
         }
         if (!recipient?.email) {
-          if (await settle(note, { status: 'failed', attempts: note.attempts + 1, last_error: '收件人邮箱已不存在' })) failed++
+          if (await settle(note, { status: 'failed', attempts: note.attempts + 1, claim_id: null, last_error: '收件人邮箱已不存在' })) failed++
           return
         }
         if (!recipient.active) {
-          if (await settle(note, { status: 'failed', attempts: note.attempts + 1, last_error: '收件人账号已停用' })) failed++
+          if (await settle(note, { status: 'failed', attempts: note.attempts + 1, claim_id: null, last_error: '收件人账号已停用' })) failed++
           return
         }
         // 发送前复核版本：被退回修改后重新提交会升 version，旧版本的提醒指向的是上一次待办。
@@ -403,7 +422,7 @@ async function handle(req: Request) {
           return
         }
         if (attempts >= NOTIFY_MAX_ATTEMPTS) {
-          if (await settle(note, { status: 'failed', attempts, last_error: errorText.slice(0, 300) })) failed++
+          if (await settle(note, { status: 'failed', attempts, claim_id: null, last_error: errorText.slice(0, 300) })) failed++
           return
         }
         if (await settle(note, { status: 'pending', attempts, last_error: errorText.slice(0, 300), next_attempt_at: new Date(Date.now() + Math.min(2 ** attempts, NOTIFY_BACKOFF_CAP_MINUTES) * 60000).toISOString() })) retried++
@@ -415,15 +434,39 @@ async function handle(req: Request) {
         const group = await recheckGroup(rows.slice(index, index + NOTIFY_CONCURRENCY))
         // 复核接口挂了就不要再往下试：本组已退回队列，本轮到此为止，下一轮再重试。
         if (recheckFailures > 0) { stop = true; break }
-        if (group.length) await Promise.all(group.map(sendOne))
+        if (group.length) {
+          // 收件地址只在整批开始时读过一次的话，"本人刚改绑邮箱"这一封会寄到旧地址（复核只判"有没有邮箱"，
+          // 判不了地址是否还是这一个）。投递前把这一组收件人重读一次，把地址的窗口压到复核 → fetch 之间。
+          // 重读失败不回退到旧快照：这一组原样退回队列，下一轮重判（与复核失败同一套降级策略），
+          // 宁可晚一轮也不把申请详情寄到一个可能已经不属于收件人的地址。
+          const fresh = await admin.from('app_users').select('id,email,active').in('id', [...new Set(group.map((note) => note.recipient_user_id))])
+          if (fresh.error) {
+            recheckFailures++
+            console.error(`notify recipient refresh failed: ${fresh.error.message}`)
+            for (const note of group) {
+              if (await settle(note, { status: 'pending', claim_id: null, lease_expires_at: new Date().toISOString(), next_attempt_at: new Date().toISOString(), last_error: '投递前复核暂时失败，已退回队列' })) deferred++
+            }
+            stop = true
+            break
+          }
+          for (const row of fresh.data ?? []) users.set(row.id, { ...(users.get(row.id) ?? {}), ...row })
+          await Promise.all(group.map(sendOne))
+        }
       }
       if (stop) {
-        // 限频或时间用尽：剩下的行（含本批还没轮到的那几个）原样退回队列，不消耗尝试次数。
+        // 限频、时间用尽或复核失败：剩下的行（含本批还没轮到的那几个）原样退回队列，不消耗尝试次数。
         // 只有写回成功的才算退回，写回失败的留给租约到期那条路。
         const leftovers = rows.filter((note) => !touched.has(note.id))
-        const message = throttleWait > 0 ? '邮件服务限频，本轮未发送' : '本轮时间用尽，已退回队列'
+        // 文案要说清"为什么停"：复核失败也会走到这里，不能一律写成"时间用尽"（那会让人去查预算）。
+        const message = throttleWait > 0
+          ? '邮件服务限频，本轮未发送'
+          : recheckFailures > 0 ? '投递前复核失败，本轮未继续，已退回队列' : '本轮时间用尽，已退回队列'
         for (let index = 0; index < leftovers.length; index += NOTIFY_CONCURRENCY) {
-          const results = await Promise.all(leftovers.slice(index, index + NOTIFY_CONCURRENCY).map((note) => release(note, message)))
+          const group = leftovers.slice(index, index + NOTIFY_CONCURRENCY)
+          const results = await Promise.all(group.map((note) => release(note, message)))
+          // 同一行只计一次：复核时已经计进「跳过」、收尾又成功退回队列的，把计数从「跳过」挪到「退回」。
+          const movedFromStale = results.filter((released, position) => released && staleIds.has(Number(group[position].id))).length
+          stale -= movedFromStale
           deferred += results.filter(Boolean).length
         }
       }
@@ -433,8 +476,8 @@ async function handle(req: Request) {
     // 审计里写清本轮的预算与开启的提醒类型：配额上限与"管理员关了哪几类"是排查"为什么没收到"的第一手信息。
     // 复核失败必须留下痕迹——否则"什么都没发生"和"复核接口挂了"在日志里长得一样。
     const recheckNote = recheckFailures > 0 ? `；投递前复核失败 ${recheckFailures} 组，相关提醒已退回队列` : ''
-    await audit(actorId, '发送邮件提醒', `${actorId ? '管理员' : '定时任务'}处理 ${rounds} 轮（预算 ${Math.round(NOTIFY_MAX_RUNTIME_MS / 1000)} 秒，已开启提醒类型 ${enabledEvents.length} 类）：发送 ${sent} 封，失败 ${failed} 封，稍后重试 ${retried} 封，作废 ${cancelled} 封，本轮退回 ${deferred} 封，丢弃 ${discarded} 封，剩余待发送 ${pendingLeft ?? 0} 封${recheckNote}`)
-    return ok({ sent, failed, retried, cancelled, deferred, discarded, recheck_failed: recheckFailures, rounds, pending: pendingLeft ?? 0 })
+    await audit(actorId, '发送邮件提醒', `${actorId ? '管理员' : '定时任务'}处理 ${rounds} 轮（预算 ${Math.round(NOTIFY_MAX_RUNTIME_MS / 1000)} 秒，已开启提醒类型 ${enabledEvents.length} 类）：发送 ${sent} 封，失败 ${failed} 封，稍后重试 ${retried} 封，作废 ${cancelled} 封，本轮退回 ${deferred} 封，丢弃 ${discarded} 封，投递前复核跳过 ${stale} 封（复核当时已不是本批的可发状态：已作废 / 已换批次 / 租约已过期；这些行本批没有投递，可能由后续轮次或下一次消费接管），剩余待发送 ${pendingLeft ?? 0} 封${recheckNote}`)
+    return ok({ sent, failed, retried, cancelled, deferred, discarded, stale, recheck_failed: recheckFailures, rounds, pending: pendingLeft ?? 0 })
   }
 
   if (action === 'public_settings') {

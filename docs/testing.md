@@ -5,37 +5,28 @@ npm install
 npm test        # 即 node --test，自动发现 tests/*.test.mjs
 ```
 
-当前 106 项，全部通过；没有 CI（仓库里没有 `.github/workflows`），所以**提交前必须本地跑一次**。耗时主要在三条真实执行测试上：`tests/sql-migrations.test.mjs`（6 项，约 18 秒，含 PGlite 整套 SQL 栈）与 `tests/app-api-notify.test.mjs`（6 项，约 9 秒，含同一个栈 + 真实 handler）。
+当前 113 项全部通过；没有 CI（仓库里没有 `.github/workflows`），**提交前必须本地跑一次**。秒级以上的耗时都花在真实执行测试上（PGlite 的整套 SQL 栈 + 真实 handler），具体数字随机器变化，不必写进文档。`tests/helpers/` 下两个模块不是用例文件，只给真实执行测试复用：`sql-stack.mjs` 是 SQL 栈加载器（含一个 cron 桩，让没有真实 pg_cron 的环境也能验证登记 SQL），`pglite-supabase-adapter.mjs` 是把 PostgREST 调用翻译成 PGlite SQL 的假 Supabase 客户端。
 
-`tests/helpers/` 下的两个模块不是测试文件（`node --test` 不会当用例跑），只给真实执行测试复用：`sql-stack.mjs` 是 SQL 栈加载器（`tests/sql-migrations.test.mjs` 断言它与自己的执行清单逐项一致，保证"执行顺序"只有一份事实来源；它还建了一个 **cron 桩**——`cron.job` + `cron.schedule/unschedule`——让没有真实 pg_cron 的环境也能验证登记 SQL），`pglite-supabase-adapter.mjs` 是把 PostgREST 调用翻译成 PGlite SQL 的假 Supabase 客户端（`.single()`/`.maybeSingle()` 与 `count` 语义对齐真实 supabase-js）。
-
-**变异测试是这一轮的验收方式**：把实现改坏一处（去掉身份检查、事件映射错位、漏掉 `status='sending'` 过滤、丢弃不计数、把总开关当关类型），`tests/sql-migrations.test.mjs` 必须失败。五个变异全部被抓到；反过来，同一批变异在修补前的 verify 上有四个能溜过去——所以新增断言时优先问"删掉实现这行会不会失败"。
+**变异验证是新增断言的验收方式**：写完一条断言后，把实现改坏一处，它必须失败。至少要能抓住：去掉领取/投递前的身份检查、事件 ↔ 状态映射错位、漏掉 `status='sending'` 过滤、丢超龄行不计数、把总开关当成"类型已关闭"、投递前复核把 `skip`/缺席当成放行、复核不比对当前申请版本与状态、复核跳过的行被"跳过"与"退回"重复计数（同一行只计一次，6 行的队列必须报出 6 个封数）、终态 `failed` 忘了清 `claim_id`、投递用的是整批开始时的收件地址快照而不是投递前重读的当前地址。抓不住的断言等于注释。
 
 ## 三类测试：能真跑的就真跑
 
-1. **真实执行**——凡是能真实运行的部分，不允许只做字符串断言：
-   - `tests/sql-migrations.test.mjs`：用 PGlite（真实 PostgreSQL 18 + pgcrypto 的 WASM 构建）按 [database-migrations.md](database-migrations.md) 的顺序，把 4 份散装 SQL、`migrations/` 下全部迁移与全部 `.verify.sql` **真的执行一遍**，再检查对象、签名与行为。PR #19 评审发现的 `array_agg(a.attname)` 解析错误（`operator does not exist: name[] = text[]`）只有真执行才抓得到。
-   - `tests/mail-relay.test.mjs`：真实 nodemailer（自定义 transport 只替换 SMTP 那一层）+ 真实 HTTP server/handler，覆盖"投递结果回来之前不能回 200"、失败回 502、鉴权/发件地址/限频与 `Retry-After`。评审发现的 `sendMail(message, { maxAttempts: 1 })`（第二个参数其实是回调，`await` 拿到 `undefined`）由它复现并永久锁住。
-   - `tests/app-api-notify.test.mjs`：把 `supabase/functions/app-api/index.ts` 真的跑起来（esbuild 转译 + 假 Supabase 客户端接在 PGlite 上 + 假邮件 fetch），驱动真实 `drainNotifications`。覆盖"领取之后、投递之前被撤角色/关类型 → `sent: 0` 且行 `cancelled`"（复审的 P1）与"预算可由 `NOTIFY_MAX_RUNTIME_MS` 覆盖并写审计"。
-   - 纯逻辑（`validateEmail`、`validateFile`、`validateStep`、`hasRole`、`isSuperAdmin`、金额与日期格式化）直接调用 `src/*-rules.js` 的真模块断言——这也是把规则从组件里抽出来的理由。
-2. **契约断言**——真实执行代价过高的"多处必须同时成立"，写对源码的断言：事件清单（前端数组 / app-api 文案表 / 数据库 `check` 约束三处逐项相等）、队列参数（前端常量 ↔ app-api 字面量 ↔ 数据库取值范围）、权限判定入口、密钥来源。它们不验证运行时行为，但能挡住最容易出的错：**改了其中一处、忘了另外两处**。
-3. **安全负向断言**——某些东西不许出现。
+1. **真实执行**——能真实运行的部分不允许只做字符串断言：
+   - `tests/sql-migrations.test.mjs`：PGlite（真实 PostgreSQL + pgcrypto 的 WASM 构建）按 [database-migrations.md](database-migrations.md) 的顺序把散装 SQL、全部迁移与全部 `.verify.sql` 真跑一遍，再检查对象、签名与行为——解析期错误（例如 `array_agg(a.attname)` 的 `name[] = text[]`）只有真执行才抓得到。
+   - `tests/mail-relay.test.mjs`：真实 nodemailer（自定义 transport 只替换 SMTP 那层）+ 真实 HTTP handler，覆盖"投递结果回来之前不能回 200"、失败 502、鉴权/发件地址/限频与 `Retry-After`。
+   - `tests/app-api-notify.test.mjs`：esbuild 转译真实 `app-api/index.ts` + 假 Supabase 客户端接 PGlite + 假邮件 fetch，驱动真实 `drainNotifications`：投递前撤角色/关类型不投递、**复核前用真实 RPC 作废正在发送的付款提醒后不投递**、失去本批租约不投递也不改状态、复核返回空数组时不放行、复核失败退回而不烧队列、复核跳过的行不被重复计数（6 行封数对齐）、失败到上限的 `failed` 释放批次号、改绑邮箱后按当前地址投递、预算与审计、结果通知开关。
+   - 纯逻辑（`validateEmail`、`validateFile`、`validateStep`、`hasRole`、金额与日期格式化）直接调 `src/*-rules.js` 的真模块——这也是把规则从组件里抽出来的理由。
+2. **契约断言**——真实执行代价过高的"多处必须同时成立"（事件清单、队列参数、权限判定入口、密钥来源）写成对源码的断言，挡住"改了一处忘另一处"。例如：
 
 ```js
-// 事件清单：前端数组 / app-api 文案表 / 数据库 check 约束，三处必须逐项相等
-assert.deepEqual(sqlEvents, NOTIFY_EVENTS);
-assert.deepEqual(apiEvents, NOTIFY_EVENTS);
-// 队列参数：前端常量 ↔ app-api 字面量 ↔ 数据库取值范围
-assert.match(api, new RegExp(`const NOTIFY_BATCH = ${NOTIFY_QUEUE.batch}\\b`));
-assert.match(migration, /p_limit < 1 or p_limit > 200/);
-// 安全负向：某些东西不许出现
-assert.equal(/action === 'bind_email'[\s\S]{0,300}body\.user_id/.test(api), false);  // 不许由请求体指定收件人
-assert.equal(api.includes('console.log(apiKey'), false);                              // 不许打印密钥
-assert.equal(cron.includes('https://'), false);                                       // 不许把项目地址写进仓库
-assert.equal(/^\s+ports:/m.test(relayBlock), false);                                  // 中继不许发布公网端口
+assert.deepEqual(sqlEvents, NOTIFY_EVENTS);                                          // 三处事件清单逐项相等
+assert.match(api, new RegExp(`const NOTIFY_BATCH = ${NOTIFY_QUEUE.batch}\\b`));      // 前端常量 ↔ app-api 字面量
+assert.equal(/action === 'bind_email'[\s\S]{0,300}body\.user_id/.test(api), false);  // 收件人不许由请求体指定
 ```
 
-> PGlite 与真实 Supabase 仍有差异（Edge Runtime、pg_cron/pg_net、Storage、托管连接池都不在里面），所以它证明的是"SQL 能被执行、行为断言成立"，**不是生产验收**。上线前仍要在测试项目上按 [database-migrations.md](database-migrations.md#执行顺序空库从零建起) 跑一遍。
+3. **安全负向断言**——某些东西不许出现（打印密钥、把项目地址写进仓库、中继发布公网端口等）。
+
+> PGlite 与真实 Supabase 有差异（Edge Runtime、pg_cron/pg_net、Storage、托管连接池都不在里面），所以它证明的是"SQL 能被真实执行、行为断言成立"，**不是生产验收**。上线前仍要在测试项目上按 [database-migrations.md](database-migrations.md#执行顺序空库从零建起) 跑一遍。
 
 ## 各测试文件负责什么
 
@@ -44,22 +35,22 @@ assert.equal(/^\s+ports:/m.test(relayBlock), false);                            
 | `tests/workflow.test.mjs` | 状态机、门槛、附件草稿/提交、身份三处一致性 |
 | `tests/member-management.test.mjs` | 成员搜索分页、内置 admin 锁定、重复提交、账户入口 |
 | `tests/admin-reporting.test.mjs` | 管理端权限、导出与账目、payload 白名单 |
-| `tests/email-notify.test.mjs` | 通知全链路契约：事件、收件人、去重与作废、身份/版本/状态三重复核、租约领取与失败上限、时间预算、限频、定时入口、隐私边界 |
-| `tests/sql-migrations.test.mjs` | **真实执行**：PGlite 里按顺序跑散装 SQL、全部迁移与全部 `.verify.sql`（6 项，约 18 秒），并校验对象、五参数签名、旧写法的必然失败与"verify 不留数据" |
-| `tests/mail-relay.test.mjs` | **真实执行**：真实 nodemailer + 真实 HTTP handler 的成功/失败/鉴权/限频四条路径 |
-| `tests/app-api-notify.test.mjs` | **真实执行**：真实 app-api handler + PGlite SQL adapter，覆盖领取后撤角色/关类型不投递、复核接口失败时退回而不烧队列、预算环境变量与审计、结果通知开关 |
-| `tests/docs.test.mjs` | 文档集完整、相对链接与锚点有效、迁移清单与事件清单与代码一致 |
-| `tests/self-host-deploy.test.mjs` | 部署层：中继接口形状与不泄露、compose 不发布端口、脚本无硬编码密钥、LF 约束 |
+| `tests/email-notify.test.mjs` | 通知全链路契约：事件清单、收件人、去重与作废、白名单复核、租约与失败上限、预算、限频、定时入口、隐私边界 |
+| `tests/sql-migrations.test.mjs` | **真实执行**：整套 SQL 栈 + 对象/签名/行为断言 |
+| `tests/mail-relay.test.mjs` | **真实执行**：真实 nodemailer + HTTP handler 的成功/失败/鉴权/限频 |
+| `tests/app-api-notify.test.mjs` | **真实执行**：真实 handler + PGlite adapter 的消费路径（见上） |
+| `tests/docs.test.mjs` | 文档集完整、相对链接与锚点有效、事件与迁移清单与代码一致 |
+| `tests/self-host-deploy.test.mjs` | 部署层：中继接口形状与不泄露、compose 不发布端口、脚本无硬编码密钥、密钥模板可被 sh 解析、LF 约束 |
 | `tests/workflow-preview.{jsx,html}` | 手工预览夹具，不参与 `npm test` |
 
 ## 加一个功能要配什么
 
-1. 迁移 + `.verify.sql`（在真实库上驱动一次行为，见 [database-migrations.md](database-migrations.md)）；新迁移会被 `tests/sql-migrations.test.mjs` 自动纳入真实执行清单。
-2. 可分层、可本地运行的部分（SQL、HTTP handler、纯函数）→ 写**真实执行**测试，不要只断言源码字符串。
+1. 迁移 + `.verify.sql`（在真实库里驱动一次行为，见 [database-migrations.md](database-migrations.md)）；新迁移会被 `tests/sql-migrations.test.mjs` 自动纳入执行清单。
+2. 可分层、可本地运行的部分（SQL、HTTP handler、纯函数）写**真实执行**测试，不要只断言源码字符串。
 3. 规则抽进 `src/*-rules.js` → 写直接调用的逻辑测试。
 4. 跨层事实（事件名、参数、权限判定、密钥来源）→ 写字符串契约断言。
 5. 安全相关 → 加一条"不许出现 X"的负向断言。
-6. 界面文案被测试引用时（例如按钮文字），改文案要同步改断言——这是有意的摩擦，防止无声改掉用户可见契约。
+6. 界面文案被测试引用时（例如按钮文字），改文案要同步改断言——这是有意的摩擦。
 
 ## 可选的运行时验证
 
@@ -67,7 +58,7 @@ assert.equal(/^\s+ports:/m.test(relayBlock), false);                            
 JSDOM_MODULE=E:\path\to\node_modules\jsdom\lib\api.js node scripts/verify-react-regressions.mjs   # 目前在本分支失效，见 known-issues
 node scripts/verify-export-workbooks.mjs                                                          # 校验导出模板
 node scripts/build-export-templates.mjs                                                           # 重新生成模板
-npx vite build                                                                                    # 唯一的 JSX 编译期检查（需要 VITE_SUPABASE_URL / VITE_SUPABASE_PUBLISHABLE_KEY，缺了 vite.config.js 会直接报错）
+npx vite build                                                                                    # 唯一的 JSX 编译期检查（缺 VITE_* 会直接报错）
 ```
 
-`npm test` **不做编译检查**，所以改过 `src/*.jsx` 之后至少跑一次 `vite build`。
+`npm test` **不做编译检查**，改过 `src/*.jsx` 之后至少跑一次 `vite build`。

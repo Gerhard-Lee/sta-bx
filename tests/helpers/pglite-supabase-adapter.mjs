@@ -168,7 +168,7 @@ class QueryBuilder {
 export function createSqlClient(db) {
   // PostgREST 按函数声明的参数类型解析请求：命名参数写进 URL，参数值按声明类型绑定。
   // 这里从 pg_proc 读出同名函数的"参数名 → 声明类型"，再按位置用 `$n::声明类型` 调用，
-  // 这样 bigint[]（app_notify_blocked_rows）与 text[]/integer/uuid 都能落在正确的重载上。
+  // 这样 bigint[]（app_notify_verify_rows）与 text[]/integer/uuid 都能落在正确的重载上。
   let signaturesCache;
   const signatures = (name) => {
     signaturesCache ??= new Map();
