@@ -69,7 +69,9 @@ begin
     select c.conname from pg_constraint c
     where c.conrelid = 'public.notifications'::regclass and c.contype = 'u'
       and (
-        select array_agg(a.attname order by a.attname)
+        -- pg_attribute.attname 是 name 类型：不显式转成 text，右侧的 text[] 字面量会让整条查询在
+        -- 解析期报 operator does not exist: name[] = text[]（即使表上没有任何旧唯一约束也照样报）。
+        select array_agg(a.attname::text order by a.attname)
         from unnest(c.conkey) as k(attnum)
         join pg_attribute a on a.attrelid = c.conrelid and a.attnum = k.attnum
       ) = array['application_id','application_version','event','recipient_user_id']
@@ -138,17 +140,52 @@ create trigger email_notify_status_change after update of status on public.appli
   for each row execute function private.enqueue_email_notification();
 revoke all on function private.enqueue_email_notification() from public, anon, authenticated;
 
--- 原子领取一轮队列：先丢弃超龄提醒，再把上次中断的 sending 行退回队列，最后带租约领取到期的 pending 行。
+-- 消费前复核收件人是否仍然合格：角色被撤销、账号被停用或邮箱被解绑之后，这个待办已经不属于他，
+-- 继续寄出等于把申请人、部门与金额发给已经没有查看权限的人。判定必须继续走 private.app_user_has_role
+-- （与入队、与站内权限同一处语义），这样"付款登记视同财委"这类身份变化自动生效。
+create or replace function private.app_notify_recipient_allowed(p_user_id uuid, p_event text)
+returns boolean language sql stable security definer set search_path = public, private, pg_temp as $$
+  select exists(
+    select 1 from public.app_users u
+    where u.id = p_user_id
+      and u.active
+      and coalesce(u.email, '') <> ''
+      and case p_event
+        when '待财委审批' then private.app_user_has_role(u.id, 'finance')
+        when '待主席审批' then private.app_user_has_role(u.id, 'chair')
+        when '待付款登记' then private.app_user_has_role(u.id, 'cashier')
+        else true
+      end
+  );
+$$;
+revoke all on function private.app_notify_recipient_allowed(uuid, text) from public, anon, authenticated;
+
+-- 原子领取一轮队列：先丢弃超龄提醒，再把上次中断的 sending 行退回队列（同样受失败上限与超龄约束），
+-- 然后作废收件人已不合格或版本已过期的提醒，最后带租约领取到期的 pending 行。
 -- p_claim_id 由调用方生成，写回结果时必须同时匹配 id、status='sending' 和 claim_id，
 -- 这样两个发送方（管理员手动点击与定时任务）不会重复寄同一封邮件，中断的批次也不会永久卡住。
-create or replace function public.app_claim_notifications(p_claim_id uuid, p_limit integer, p_lease_seconds integer, p_max_age_hours integer)
+-- p_max_attempts 与调用方（app-api 的 NOTIFY_MAX_ATTEMPTS）保持一致：中断恢复与投递失败共用同一个上限。
+-- 本文件的前一版是四参数签名，先按函数名删掉所有重载，避免 PostgREST 命名参数调用出现歧义。
+do $$
+declare item record;
+begin
+  for item in
+    select p.oid, p.proname from pg_proc p
+    join pg_namespace n on n.oid = p.pronamespace
+    where n.nspname = 'public' and p.proname = 'app_claim_notifications'
+  loop
+    execute format('drop function public.%I(%s)', item.proname, pg_get_function_identity_arguments(item.oid));
+  end loop;
+end $$;
+create or replace function public.app_claim_notifications(p_claim_id uuid, p_limit integer, p_lease_seconds integer, p_max_age_hours integer, p_max_attempts integer default 5)
 returns jsonb language plpgsql security definer set search_path = public, private, pg_temp as $$
-declare claimed jsonb; discarded integer; taken integer;
+declare claimed jsonb; discarded integer; cancelled integer; revoked integer; taken integer;
 begin
   if p_claim_id is null then raise exception '缺少领取批次号'; end if;
   if p_limit is null or p_limit < 1 or p_limit > 200 then raise exception '领取数量无效'; end if;
   if p_lease_seconds is null or p_lease_seconds < 30 or p_lease_seconds > 900 then raise exception '发送租约无效'; end if;
   if p_max_age_hours is null or p_max_age_hours < 1 or p_max_age_hours > 168 then raise exception '队列有效期无效'; end if;
+  if p_max_attempts is null or p_max_attempts < 1 or p_max_attempts > 10 then raise exception '失败重试上限无效'; end if;
 
   -- 开关关闭期间积压的提醒不再补发：重新开启时突然寄出几天前的邮件会让成员困惑。
   update public.notifications
@@ -156,12 +193,45 @@ begin
    where status = 'pending' and created_at < now() - make_interval(hours => p_max_age_hours);
   get diagnostics discarded = row_count;
 
-  -- 上次进程被中断（函数超时或被杀）留下的 sending 行：计入一次尝试后退回队列，避免无限重试。
+  -- 上次进程被中断（函数超时或被杀）留下的 sending 行：超龄的与已经用满尝试次数的直接判失败，
+  -- 其余计入一次尝试后退回队列。恢复路径与普通投递失败共用同一个上限，反复中断不会无限重领；
+  -- 超龄行在这里就丢弃，不会因为"先恢复成 pending"而绕过本轮的超龄清理。
+  update public.notifications
+     set status = 'failed', attempts = attempts + 1, claim_id = null, lease_expires_at = now(),
+         last_error = left(case
+           when created_at < now() - make_interval(hours => p_max_age_hours)
+             then '超过 ' || p_max_age_hours || ' 小时未发送，已丢弃'
+           else '连续 ' || (attempts + 1) || ' 次发送未完成，已停止重试'
+         end, 300)
+   where status = 'sending' and lease_expires_at <= now()
+     and (created_at < now() - make_interval(hours => p_max_age_hours) or attempts + 1 >= p_max_attempts);
+
   update public.notifications
      set status = 'pending', attempts = attempts + 1, claim_id = null, next_attempt_at = now(),
          last_error = left(case when last_error = '' then '上一次发送未完成，已重新排队'
                                 else '上一次发送未完成，已重新排队 | ' || last_error end, 300)
    where status = 'sending' and lease_expires_at <= now();
+
+  -- 发送前复核收件人：角色被撤销、账号被停用或邮箱被解绑之后，这个待办已经不属于他，
+  -- 继续寄出等于把申请人、部门与金额发给已经没有查看权限的人。作废（cancelled）不参与去重，
+  -- 身份恢复且待办再次出现时还能重新提醒。只碰 pending：别人正在发送的行不能被这里抢标签。
+  update public.notifications n
+     set status = 'cancelled', claim_id = null, lease_expires_at = now(),
+         last_error = '收件人已不具备该待办的处理身份，提醒已作废'
+   where n.status = 'pending' and not private.app_notify_recipient_allowed(n.recipient_user_id, n.event);
+  get diagnostics cancelled = row_count;
+
+  -- 发送前复核版本：申请被退回修改后重新提交会升 version，旧版本的提醒指向的是上一次待办。
+  -- 状态可能绕一圈回到同一个值（finance_pending → changes_requested → finance_pending），只比状态认不出来，
+  -- 于是同一件事会连发两封。版本不一致的 pending 行就地作废（handler 侧还会对领取后变化的版本再核一次）。
+  update public.notifications n
+     set status = 'cancelled', claim_id = null, lease_expires_at = now(),
+         last_error = '申请已重新提交（版本 ' || n.application_version || ' → ' || a.version || '），提醒已作废'
+    from public.applications a
+   where a.id = n.application_id and a.version <> n.application_version
+     and n.status = 'pending';
+  get diagnostics revoked = row_count;
+  cancelled := cancelled + revoked;
 
   update public.notifications
      set status = 'sending', lease_expires_at = now() + make_interval(secs => p_lease_seconds), claim_id = p_claim_id
@@ -184,7 +254,7 @@ begin
   from public.notifications
   where claim_id = p_claim_id and status = 'sending';
 
-  return jsonb_build_object('discarded', discarded, 'claimed', taken, 'rows', claimed);
+  return jsonb_build_object('discarded', discarded, 'cancelled', cancelled, 'claimed', taken, 'rows', claimed);
 end $$;
 
 -- 永久失败（尝试次数用满）的提醒在配置好邮件服务后可以重新排队；保留 last_error 便于管理员看原因。
@@ -263,11 +333,11 @@ end $$;
 
 revoke all on function public.app_bind_email(uuid, uuid, text) from public, anon, authenticated;
 revoke all on function public.app_update_email_notify(uuid, boolean) from public, anon, authenticated;
-revoke all on function public.app_claim_notifications(uuid, integer, integer, integer) from public, anon, authenticated;
+revoke all on function public.app_claim_notifications(uuid, integer, integer, integer, integer) from public, anon, authenticated;
 revoke all on function public.app_reset_failed_notifications(uuid) from public, anon, authenticated;
 revoke all on function public.app_admin_create_user(uuid, text, text, text, text, text[], text) from public, anon, authenticated;
 grant execute on function public.app_bind_email(uuid, uuid, text) to service_role;
 grant execute on function public.app_update_email_notify(uuid, boolean) to service_role;
-grant execute on function public.app_claim_notifications(uuid, integer, integer, integer) to service_role;
+grant execute on function public.app_claim_notifications(uuid, integer, integer, integer, integer) to service_role;
 grant execute on function public.app_reset_failed_notifications(uuid) to service_role;
 grant execute on function public.app_admin_create_user(uuid, text, text, text, text, text[], text) to service_role;

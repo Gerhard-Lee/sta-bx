@@ -17,14 +17,15 @@ npm run dev
 
 数据库迁移位于 `supabase/migrations/`。应用使用自己的 `app_users` 和 `app_sessions` 表登录，不使用 Supabase Auth；`supabase/functions/app-api` 是唯一的数据访问入口，前端不会直接读取业务表。数据库包含角色、申请、审批动作、私有文件元数据、付款记录、审计记录、RLS、Storage bucket 和受保护的工作流函数。每份新迁移都配同名 `.verify.sql`，在事务里执行、不保留验证数据。
 
-**执行顺序**：`supabase/` 根目录下还有几份历史 SQL 没有收进 `migrations/`，新迁移依赖其中的函数，请按顺序执行：
+**执行顺序（空库从零建起）**：`supabase/` 根目录下还有几份历史 SQL 没有收进 `migrations/`，顺序由依赖决定，不是"散装 SQL 先、迁移后"：
 
-1. `supabase/admin-settings-audit.sql`（提供 `private.app_insert_user`、`public.app_admin_create_user` 等）
-2. `supabase/member-management-and-resubmission.sql`（提供 `public.app_list_members` 等）
-3. `supabase/detailed-file-and-review-audit.sql` 与 `supabase/explicit-submission.sql`
-4. `supabase/migrations/` 内按文件名时间戳顺序
+1. 基线段迁移：`supabase/migrations/20260929130000_funds.sql`、`20260929130500`、`20260929180000`、`20260929181000`、`20260929190000`、`20261002133000`、`20261005010000`（建出 `settings`/`profiles`/`app_users` 等表，并给出 `private.app_user_has_role` 的当前语义；只有邮件那两条留到第 5 步）
+2. `supabase/admin-settings-audit.sql`（提供 `private.app_insert_user`、`public.app_admin_create_user` 等），随后是空库时才需要的**内置 `admin` 账号**
+3. `supabase/member-management-and-resubmission.sql`（提供 `public.app_list_members` 等；它会锁死 admin 账号，所以第 2 步的建号必须在此之前）
+4. `supabase/detailed-file-and-review-audit.sql` 与 `supabase/explicit-submission.sql`
+5. 其余迁移按文件名时间戳升序：`20261004210000_email_notify.sql`、`20261005140000_email_notify_cron.sql`
 
-`supabase/migrations/20261004210000_email_notify.sql` 开头会检查第 1 步是否完成，缺依赖时迁移直接报错，不会拖到“添加用户”在运行期才失败。
+这套顺序有可执行版本：`tests/sql-migrations.test.mjs` 会在 PGlite 里按同样的顺序把整套 SQL 真跑一遍。`supabase/migrations/20261004210000_email_notify.sql` 开头还会检查第 2 步是否完成，缺依赖时迁移直接报错，不会拖到“添加用户”在运行期才失败。
 
 邮件通知默认关闭：在「设置 → 邮件通知」开启后，**只在出现待办时**入队发信——待财委审批、待主席审批、待付款登记发给拥有对应处理身份的成员（不含申请人自己），退回修改、待补充收款码发给申请人本人；拒绝申请、已付款、已撤回属于完结态，没有需要动手的事，不发邮件。发送使用 HTTP 邮件服务（请求体为 `from/to/subject/html`，兼容 Resend 等 API；只有 SMTP 邮箱时可在同一台服务器加一个 HTTP→SMTP 中继），需为 app-api 配置以下 Edge Function 密钥（`supabase secrets set ...`），密钥不进入前端、仓库、数据库或日志：
 
@@ -34,7 +35,7 @@ npm run dev
 - `APP_URL`：可选，邮件正文中的平台入口链接
 - `CRON_SECRET`：可选，定时任务消费队列用的随机密钥。未设置时定时入口一律拒绝（401），队列只能由管理员手动消费
 
-消费队列有两个入口，共用同一段逻辑：管理员在「设置 → 邮件通知」点「立即发送」，或定时任务调用 `send_notifications`（带 `x-app-cron: <CRON_SECRET>` 请求头）。定时入口不借用任何人的登录会话，也允许这一个动作，其余动作仍必须登录。每一轮先调用 `app_claim_notifications` 原子领取一批（`FOR UPDATE SKIP LOCKED` + 租约 + 批次号），写回结果时必须同时匹配这三个条件，因此两个人同时点也不会把同一封邮件寄两次；进程被超时打断的批次会连同一次尝试计入下一轮，不会卡在“发送中”。失败按 2^n 分钟退避，五次后转永久失败并保留原因，配好邮件服务后可以点「失败项重新排队」。开关关闭期间积压的提醒超过 24 小时会被丢弃，避免重新开启时突然补发几天前的邮件。发信前还会复核申请状态：已经不需要处理的提醒（被别人处理、撤回或换了收款人）标记为「已作废」而不再寄出；邮件服务返回 429 限频时按 `Retry-After` 暂停本轮、稍后自动重试，不计入失败次数；一轮消费有 240 秒时间预算（托管环境墙钟上限是 150/400 秒），到点把没发出去的提醒原样退回队列。
+消费队列有两个入口，共用同一段逻辑：管理员在「设置 → 邮件通知」点「立即发送」，或定时任务调用 `send_notifications`（带 `x-app-cron: <CRON_SECRET>` 请求头）。定时入口不借用任何人的登录会话，也允许这一个动作，其余动作仍必须登录。每一轮先调用 `app_claim_notifications` 原子领取一批（`FOR UPDATE SKIP LOCKED` + 租约 + 批次号），写回结果时必须同时匹配这三个条件，因此两个人同时点也不会把同一封邮件寄两次；进程被超时打断的批次会连同一次尝试计入下一轮，连续五次仍未完成就转永久失败（不会无限重领），超龄的“发送中”行直接丢弃。失败按 2^n 分钟退避，五次后转永久失败并保留原因，配好邮件服务后可以点「失败项重新排队」。开关关闭期间积压的提醒超过 24 小时会被丢弃，避免重新开启时突然补发几天前的邮件。发信前还会复核三件事：申请状态、申请版本（被退回修改后重新提交会升版本，旧提醒作废）、以及收件人当前身份（角色被撤销、账号被停用或解绑邮箱后就地作废，不再把申请详情寄给已经没有查看权限的人）；邮件服务返回 429 限频时按 `Retry-After` 暂停本轮、稍后自动重试，不计入失败次数；一轮消费有 240 秒时间预算（托管环境墙钟上限是 150/400 秒），到点把没发出去的提醒原样退回队列。
 
 定时消费用 pg_cron（`supabase/migrations/20261005140000_email_notify_cron.sql`）。项目地址与密钥不进仓库，先在数据库上设置三个参数，再执行该迁移；之后改完密钥可以随时调用 `select public.app_register_email_cron();` 重新登记（按任务名覆盖，不会重复）：
 

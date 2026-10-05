@@ -17,21 +17,25 @@ const api = source('supabase/functions/app-api/index.ts');
 
 test('中继的接口形状与 app-api 的发送请求完全一致', () => {
   assert.match(relay, /req\.method !== 'POST' \|\| req\.url !== '\/send'/);
-  assert.match(relay, /req\.headers\.authorization !== `Bearer \$\{RELAY_TOKEN\}`/);
+  assert.match(relay, /req\.headers\.authorization !== `Bearer \$\{token\}`/);
   for (const field of ['payload.to', 'payload.from', 'payload.subject', 'payload.html']) assert.ok(relay.includes(field), `中继缺少 ${field}`);
   assert.match(relay, /reply\(res, 200, '已受理'\)/);
   assert.match(relay, /fetch\('http:\/\/127\.0\.0\.1:8080\/health'\)|GET' && \(req\.url === '\/health'/);
 });
 test('中继挡住误配：收件地址要合法，发件地址必须等于认证账号，超频返回 429 与 Retry-After', () => {
   assert.match(relay, /if \(!EMAIL\.test\(to\)\) return reply\(res, 400, '收件地址格式不正确'\)/);
-  assert.match(relay, /if \(from !== BARE_SMTP_USER\) return reply\(res, 400, `发件地址必须等于 \$\{SMTP_USER\}`\)/);
+  assert.match(relay, /if \(from !== bareSmtpUser\) return reply\(res, 400, `发件地址必须等于 \$\{smtpUser\}`\)/);
   assert.match(relay, /const bareAddress = /);
   assert.match(relay, /if \(!allowSend\(\)\) return reply\(res, 429/);
   // 限频要告诉调用方还要等多久：app-api 据此暂停本轮，而不是把 429 记成一次失败尝试。
   assert.match(relay, /const throttleWaitSeconds = \(\) => Math\.max\(1, Math\.ceil\(\(60_000 - \(Date\.now\(\) - windowStart\)\) \/ 1000\)\)/);
   assert.match(relay, /'retry-after': String\(throttleWaitSeconds\(\)\)/);
   assert.match(relay, /return reply\(res, 502, String\(error\?\.response \?\? error\?\.message/);
-  assert.match(relay, /maxAttempts: 1/);
+  // 只能 await sendMail(message)：第二个参数在 nodemailer 里是回调，传对象会让 200 先于投递结果发出，
+  // 之后库再把它当回调调用，抛出的 TypeError 不在 try/catch 里（评审在隔离环境里复现过）。
+  // 运行时行为由 tests/mail-relay.test.mjs 用真实 nodemailer + 桩 transport 覆盖。
+  assert.match(relay, /await transporter\.sendMail\(\{ from: payload\.from, to, subject, html \}\)/);
+  assert.equal(/maxAttempts/.test(relay), false, 'sendMail 的第二个参数是回调，不能再传 options');
 });
 test('中继不泄露授权码、正文与收件清单', () => {
   assert.equal(/console\.(log|error)\([\s\S]{0,140}(SMTP_PASS|RELAY_TOKEN|EMAIL_RELAY_TOKEN|payload\.html|subject)/.test(relay), false);

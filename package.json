@@ -13,5 +13,9 @@
     "react": "^19.1.1",
     "react-dom": "^19.1.1",
     "vite": "^7.1.7"
+  },
+  "devDependencies": {
+    "@electric-sql/pglite": "^0.5.8",
+    "nodemailer": "^6.9.15"
   }
 }

@@ -240,13 +240,16 @@ async function handle(req: Request) {
     while (rounds < NOTIFY_ROUNDS && !stop) {
       if (timeLeft() <= 0) break
       const claimId = crypto.randomUUID()
-      const claim = await rpc('app_claim_notifications', { p_claim_id: claimId, p_limit: NOTIFY_BATCH, p_lease_seconds: NOTIFY_LEASE_SECONDS, p_max_age_hours: NOTIFY_MAX_AGE_HOURS })
+      const claim = await rpc('app_claim_notifications', { p_claim_id: claimId, p_limit: NOTIFY_BATCH, p_lease_seconds: NOTIFY_LEASE_SECONDS, p_max_age_hours: NOTIFY_MAX_AGE_HOURS, p_max_attempts: NOTIFY_MAX_ATTEMPTS })
       discarded += Number(claim?.discarded ?? 0)
+      // 领取时顺带作废的“收件人已经没有该待办身份”的行由数据库判定（private.app_user_has_role），
+      // 这里只把它计进管理面板的“已作废”，状态语义与 handler 自己复核出来的作废完全一致。
+      cancelled += Number(claim?.cancelled ?? 0)
       const rows: Record<string, any>[] = Array.isArray(claim?.rows) ? claim.rows : []
       if (!rows.length) break
       rounds++
       const [appsResult, recipientsResult] = await Promise.all([
-        admin.from('applications').select('id,title,amount,department,category,status,owner_id').in('id', [...new Set(rows.map((row) => row.application_id))]),
+        admin.from('applications').select('id,title,amount,department,category,status,version,owner_id').in('id', [...new Set(rows.map((row) => row.application_id))]),
         admin.from('app_users').select('id,email,full_name,username,active').in('id', [...new Set(rows.map((row) => row.recipient_user_id))]),
       ])
       if (appsResult.error || recipientsResult.error) throw new Error('通知数据读取失败。')
@@ -284,6 +287,13 @@ async function handle(req: Request) {
         }
         if (!recipient.active) {
           if (await settle(note, { status: 'failed', attempts: note.attempts + 1, last_error: '收件人账号已停用' })) failed++
+          return
+        }
+        // 发送前复核版本：被退回修改后重新提交会升 version，旧版本的提醒指向的是上一次待办。
+        // 状态可能绕一圈又回到同一个值（finance_pending → changes_requested → finance_pending），
+        // 只比状态会把上一版的旧提醒当成有效待办再寄一次，所以版本不匹配就作废。
+        if (typeof app.version === 'number' && app.version !== note.application_version) {
+          if (await settle(note, { status: 'cancelled', claim_id: null, last_error: `申请已重新提交（版本 ${note.application_version} → ${app.version}），提醒已作废` })) cancelled++
           return
         }
         // 发送前复核：申请已经离开这个待办状态（被别人处理、被撤回、收款人换了）就不再催，

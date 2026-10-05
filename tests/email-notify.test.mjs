@@ -77,8 +77,45 @@ test('收件人由服务端按状态推导：审批事件给对应角色且跳�
   assert.equal((migration.match(/u\.id <> new\.owner_id/g) ?? []).length, 3);
   assert.match(migration, /where u\.active\s+and coalesce\(u\.email, ''\) <> ''/);
   // 身份含义变化（例如付款登记视同财委）只需要改 private.app_user_has_role，这里必须继续走同一个判定函数。
-  assert.equal((migration.match(/private\.app_user_has_role\(u\.id/g) ?? []).length, 3);
+  // 入队（触发器）与消费前复核（app_notify_recipient_allowed）两处都只能走它，不许直接查 user_roles。
+  const trigger = slice(migration, 'create or replace function private.enqueue_email_notification()', 'drop trigger if exists email_notify_status_change');
+  assert.equal((trigger.match(/private\.app_user_has_role\(u\.id/g) ?? []).length, 3);
+  const consumerCheck = slice(migration, 'create or replace function private.app_notify_recipient_allowed', 'revoke all on function private.app_notify_recipient_allowed');
+  assert.equal((consumerCheck.match(/private\.app_user_has_role\(u\.id/g) ?? []).length, 3);
   assert.equal(/from public\.user_roles\s+where user_id = u\.id/.test(migration), false);
+});
+test('消费前复核收件人身份：角色被撤销、账号停用或邮箱解绑后不再寄出财务详情', () => {
+  assert.match(migration, /create or replace function private\.app_notify_recipient_allowed\(p_user_id uuid, p_event text\)/);
+  assert.match(migration, /when '待财委审批' then private\.app_user_has_role\(u\.id, 'finance'\)/);
+  assert.match(migration, /when '待主席审批' then private\.app_user_has_role\(u\.id, 'chair'\)/);
+  assert.match(migration, /when '待付款登记' then private\.app_user_has_role\(u\.id, 'cashier'\)/);
+  assert.match(migration, /where n\.status = 'pending' and not private\.app_notify_recipient_allowed\(n\.recipient_user_id, n\.event\)/);
+  assert.match(migration, /收件人已不具备该待办的处理身份，提醒已作废/);
+  assert.match(migration, /revoke all on function private\.app_notify_recipient_allowed\(uuid, text\) from public, anon, authenticated/);
+  // 作废发生在领取之前，只有 pending 会被碰：别人正在发送的行不能被抢标签。
+  assert.equal(/status in \('pending','sending'\) and not private\.app_notify_recipient_allowed/.test(migration), false);
+  // 数据库侧作废的数量要计进管理面板的“已作废”，否则管理员看到的数字与实际不符。
+  assert.match(api, /cancelled \+= Number\(claim\?\.cancelled \?\? 0\)/);
+  assert.match(migration, /jsonb_build_object\('discarded', discarded, 'cancelled', cancelled, 'claimed', taken, 'rows', claimed\)/);
+  assert.match(verify, /撤销身份后应作废指向该收件人的提醒/);
+  assert.match(verify, /撤销身份后不应再有指向该收件人的待发提醒/);
+  assert.match(verify, /身份撤销导致的作废应保留原因/);
+});
+test('发送前复核申请版本：跨版本重提后旧版本的提醒作废，不会和新版本一起寄出', () => {
+  const sendOne = slice(api, 'const sendOne = async', 'for (let index = 0;');
+  assert.match(api, /admin\.from\('applications'\)\.select\('id,title,amount,department,category,status,version,owner_id'\)/);
+  assert.match(sendOne, /if \(typeof app\.version === 'number' && app\.version !== note\.application_version\)/);
+  assert.match(sendOne, /status: 'cancelled', claim_id: null, last_error: `申请已重新提交（版本 \$\{note\.application_version\} → \$\{app\.version\}），提醒已作废`/);
+  // 领取时也复核版本：pending 行与 applications.version 不一致就地作废（只碰 pending，不抢正在发送的行）。
+  assert.match(migration, /from public\.applications a\s+where a\.id = n\.application_id and a\.version <> n\.application_version\s+and n\.status = 'pending'/);
+  assert.match(migration, /'申请已重新提交（版本 ' \|\| n\.application_version \|\| ' → ' \|\| a\.version \|\| '），提醒已作废'/);
+  assert.match(migration, /cancelled := cancelled \+ revoked/);
+  assert.match(verify, /版本不一致的旧提醒应在领取时作废/);
+  assert.match(verify, /版本作废应保留原因/);
+  assert.match(verify, /当前版本的提醒不应被误作废/);
+  // 领取结果本来就带 application_version，必须用它比较，而不是重新查一次当前值。
+  assert.match(migration, /'event', event, 'recipient_user_id', recipient_user_id, 'attempts', attempts, 'last_error', last_error/);
+  assert.match(migration, /'application_version', application_version/);
 });
 test('同一申请同一版本同一事件同一收件人只保留一封待发邮件，已作废的不占名额', () => {
   assert.match(migration, /create unique index if not exists notifications_dedupe_idx\s+on public\.notifications\(application_id, application_version, event, recipient_user_id\)\s+where status <> 'cancelled'/);
@@ -138,22 +175,32 @@ test('队列消费参数在前端、后端与数据库取值范围三方一致',
   assert.ok(NOTIFY_QUEUE.leaseSeconds * 1000 > NOTIFY_QUEUE.sendTimeoutMs, '租约必须比单封超时更久，否则慢批次会被别人抢走');
 });
 test('发送前先原子领取：带批次号与租约，写回必须同时匹配，两个发送方不会重复寄信', () => {
-  assert.match(migration, /create or replace function public\.app_claim_notifications\(p_claim_id uuid, p_limit integer, p_lease_seconds integer, p_max_age_hours integer\)/);
+  assert.match(migration, /create or replace function public\.app_claim_notifications\(p_claim_id uuid, p_limit integer, p_lease_seconds integer, p_max_age_hours integer, p_max_attempts integer default 5\)/);
   assert.match(migration, /for update skip locked/);
   assert.match(migration, /set status = 'sending', lease_expires_at = now\(\) \+ make_interval\(secs => p_lease_seconds\), claim_id = p_claim_id/);
-  assert.match(api, /rpc\('app_claim_notifications', \{ p_claim_id: claimId, p_limit: NOTIFY_BATCH, p_lease_seconds: NOTIFY_LEASE_SECONDS, p_max_age_hours: NOTIFY_MAX_AGE_HOURS \}\)/);
+  assert.match(api, /rpc\('app_claim_notifications', \{ p_claim_id: claimId, p_limit: NOTIFY_BATCH, p_lease_seconds: NOTIFY_LEASE_SECONDS, p_max_age_hours: NOTIFY_MAX_AGE_HOURS, p_max_attempts: NOTIFY_MAX_ATTEMPTS \}\)/);
   assert.match(api, /\.eq\('id', note\.id\)\.eq\('status', 'sending'\)\.eq\('claim_id', claimId\)/);
   assert.match(migration, /status text not null default 'pending' check \(status in \('pending','sending','sent','failed','cancelled'\)\)/);
+  // 旧的四参数签名必须先删掉，否则 PostgREST 的命名参数调用会在两个重载之间产生歧义。
+  assert.match(migration, /where n\.nspname = 'public' and p\.proname = 'app_claim_notifications'[\s\S]{0,120}drop function public\.%I\(%s\)/);
 });
-test('中断批次退回队列并计入尝试，超龄提醒丢弃且保留原因', () => {
+test('中断批次退回队列并计入尝试，超龄提醒丢弃且保留原因，恢复路径同样受失败上限约束', () => {
   assert.match(migration, /where status = 'sending' and lease_expires_at <= now\(\)/);
   assert.match(migration, /set status = 'pending', attempts = attempts \+ 1, claim_id = null, next_attempt_at = now\(\)/);
   assert.match(migration, /上一次发送未完成，已重新排队/);
   assert.match(migration, /where status = 'pending' and created_at < now\(\) - make_interval\(hours => p_max_age_hours\)/);
   assert.match(migration, /小时未发送，已丢弃/);
+  // 恢复路径也执行失败上限，并且超龄的 sending 行直接判丢弃，不会先退回队列再被本轮寄出。
+  assert.match(migration, new RegExp(`p_max_attempts integer default ${NOTIFY_QUEUE.maxAttempts}\\)`));
+  assert.match(migration, /attempts \+ 1 >= p_max_attempts/);
+  assert.match(migration, /'连续 ' \|\| \(attempts \+ 1\) \|\| ' 次发送未完成，已停止重试'/);
+  assert.match(migration, /if p_max_attempts is null or p_max_attempts < 1 or p_max_attempts > 10 then raise exception '失败重试上限无效'/);
+  assert.match(api, /p_max_attempts: NOTIFY_MAX_ATTEMPTS/);
   assert.match(verify, /中断批次应重新领取并计入一次尝试/);
   assert.match(verify, /超龄提醒不应继续留在队列/);
   assert.match(verify, /丢弃应保留原因/);
+  assert.match(verify, /中断恢复应在尝试次数用满后判失败/);
+  assert.match(verify, /超龄的发送中行恢复时应记为已丢弃/);
 });
 test('队列消费只有一个实现，管理员会话与定时任务共用', () => {
   assert.match(api, /const drainNotifications = async \(actorId: string \| null\) =>/);
@@ -278,6 +325,11 @@ test('定时消费用 pg_cron，缺扩展或未配置时只提示不阻塞，且
   assert.match(cron, /for old_job in select jobid from cron\.job where jobname = job_name loop/);
   assert.equal(cron.includes('https://'), false, '项目地址来自数据库参数，不写进仓库');
   assert.match(cronVerify, /重复登记应只保留一条调度/);
+  // PL/pgSQL 的 RAISE 不能用 || 拼字符串（'…' || var 是语法错误，评审在邮件迁移里发现过一次，
+  // 姊妹脚本 20261005140000_email_notify_cron.verify.sql 里还有一处，是真实执行测试抓出来的）。
+  for (const text of [verify, cronVerify]) {
+    assert.equal(/raise\s+(exception|notice)\s+'[^']*'\s*\|\|/.test(text), false, 'RAISE 必须用 % 占位符，不能拼字符串');
+  }
   assert.match(readme, /app_register_email_cron/);
 });
 test('迁移先检查散装 SQL 的前置依赖，避免运行期才报函数不存在', () => {
@@ -338,7 +390,7 @@ test('账户入口不再只叫修改密码', () => {
 test('新表和新函数延续最小权限：RLS 加 service_role 专属执行', () => {
   assert.match(migration, /alter table public\.notifications enable row level security/);
   assert.match(migration, /revoke all on table public\.notifications from public, anon, authenticated/);
-  for (const fn of ['app_bind_email(uuid, uuid, text)', 'app_update_email_notify(uuid, boolean)', 'app_claim_notifications(uuid, integer, integer, integer)', 'app_reset_failed_notifications(uuid)']) {
+  for (const fn of ['app_bind_email(uuid, uuid, text)', 'app_update_email_notify(uuid, boolean)', 'app_claim_notifications(uuid, integer, integer, integer, integer)', 'app_reset_failed_notifications(uuid)']) {
     assert.ok(migration.includes(`revoke all on function public.${fn} from public, anon, authenticated;`));
     assert.ok(migration.includes(`grant execute on function public.${fn} to service_role;`));
   }
@@ -352,7 +404,7 @@ test('迁移行为验证真的驱动状态变化，而不是只看对象是否�
     "update public.applications set status = 'finance_pending', version = 1 where id = app_id;",
     '已绑定邮箱的财委应收到待审批提醒',
     '申请人本人、未绑定邮箱和已停用的成员都不应入队',
-    'public.app_claim_notifications(claim_1, 200, 300, 24)',
+    'public.app_claim_notifications(claim_1, 200, 300, 24, 5)',
     '已领取的行必须处于发送中',
     '领取必须带上未过期的租约',
     '同一封邮件不应被两个批次领取',

@@ -23,7 +23,7 @@ begin
   perform public.app_register_email_cron();
   perform public.app_register_email_cron();
   select count(*) into jobs from cron.job where jobname = 'email-notify-drain';
-  if jobs <> 1 then raise exception '重复登记应只保留一条调度，实际 ' || jobs; end if;
+  if jobs <> 1 then raise exception '重复登记应只保留一条调度，实际 %', jobs; end if;
   if not exists(select 1 from cron.job where jobname = 'email-notify-drain' and schedule = '*/5 * * * *') then raise exception '调度周期应为每 5 分钟'; end if;
   if not exists(select 1 from cron.job where jobname = 'email-notify-drain' and command like '%x-app-cron%') then raise exception '调度命令必须携带定时密钥头'; end if;
 end $$;

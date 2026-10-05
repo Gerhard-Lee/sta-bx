@@ -91,14 +91,16 @@ last_error text · created_at · sent_at
 状态流转与并发语义：
 
 ```
-触发器入队 → pending ──app_claim_notifications（租约 + 批次号）──► sending
+触发器入队 → pending ──app_claim_notifications（租约 + 批次号 + 超龄小时 + 失败上限）──► sending
+   pending ── 领取时复核收件人身份不合格（角色撤销/停用/解绑邮箱）或版本已过期 ──► cancelled（终态，不寄出）
    sending ── 发送成功 ──► sent
    sending ── 状态已变（发送前复核失败）──► cancelled（终态，不寄出）
    sending ── HTTP 429 限频 ──► pending（按 Retry-After 延后，不计 attempts）
    sending ── 失败且 attempts < 5 ──► pending（next_attempt_at 退避）
    sending ── 失败且 attempts >= 5 ──► failed（可用 app_reset_failed_notifications 退回 pending）
    sending ── 一轮时间预算用尽 ──► pending（原样退回，不计 attempts）
-   sending ── 租约到期（进程被硬中断）──► pending，并计入一次 attempts
+   sending ── 租约到期（进程被硬中断）且 attempts + 1 < 5 ──► pending，并计入一次 attempts
+   sending ── 租约到期且 attempts + 1 >= 5 或已超龄 ──► failed（"连续 N 次发送未完成"／"已丢弃"）
    pending 且 created_at 超过 24 小时 ──► failed（原因："超过 24 小时未发送，已丢弃"）
    本轮尚未作废的「待付款登记」提醒（含已发出的）── 收款码被移除（payment_pending → payment_info_required）──► cancelled
 ```

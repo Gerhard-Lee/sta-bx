@@ -59,7 +59,7 @@
 
 ## 12 `20261004210000_email_notify.sql` 被就地改写过
 
-该迁移在**未合并、从未部署**的分支上，因此审查修复时直接改了它两次：第一次新增 `sending` 状态、租约、事件集收窄；第二次新增 `cancelled` 终态、把去重唯一约束换成部分唯一索引、`app_bind_email` 改成三参数。每次都保留了对旧结构收敛的 `alter` / `drop ... if exists` 语句。
+该迁移在**未合并、从未部署**的分支上，因此审查修复时直接改了它三次：第一次新增 `sending` 状态、租约、事件集收窄；第二次新增 `cancelled` 终态、把去重唯一约束换成部分唯一索引、`app_bind_email` 改成三参数；第三次（PR #19 外部评审）修 `array_agg(a.attname)` 的 `name[] = text[]` 解析错误、加 `app_notify_recipient_allowed` 消费前身份复核、把 `app_claim_notifications` 改成五参数（失败上限）并让恢复路径也执行它。每次都保留了对旧结构收敛的 `alter` / `drop ... if exists` / 按函数名删重载的语句，因此对"已经执行过旧版"的库重跑本文件仍然有效。
 **如果有人已经在自己的库上执行过旧版本**：迁移账本与文件内容不一致，需要 `supabase migration repair` 或手工重跑该文件（它是幂等的）。
 
 ## 已修（本轮邮件审查的产出，留此备查）
@@ -71,3 +71,23 @@
 发送前不复核状态导致寄出"已经做完的事"、正文状态与事件标题矛盾 → 事件→状态映射 + `cancelled`；中继每分钟 12 封的限频被当成失败、几十分钟就把积压打成永久失败 → 429 不计尝试次数、按 `Retry-After` 暂停本轮；一轮 800 封撞上函数墙钟被硬杀、剩余行还要吃一次尝试 → 240 秒时间预算 + 原样退回；同一版本内"收款码移除 → 重新提交"漏提醒 → 离开 `payment_pending` 时作废旧提醒、去重改部分唯一索引；`app_bind_email` 数据库层不校验调用者 → 三参数签名强制本人；`sameSecret` 注释与实现不符 → 改成如实描述；fail-fast 只查一个依赖 → 补齐 `app_set_member_roles` 与 `app_user_has_role`；`docs/testing.md` 的测试数过期、两处文档锚点失效 → 已更正。详见 [notifications.md](notifications.md) 与 [decisions.md](decisions.md)。
 
 独立复核（只读审查）后又补了四处：自托管 cron 的 curl 超时 90 秒小于函数预算 240 秒 → 默认改 300 秒并用测试绑住两个数；写回失败被当成已处理（计数虚报、行卡在"发送中"）→ `settle` 返回是否成功、计数只在成功后加；迁移里删约束/删函数的作用域过大 → 只删去重那一组列、按函数名删所有重载；领取结果不带 `last_error` → 带上它，退回时不再冲掉上一次的失败原因。
+
+## 已修（PR #19 外部评审的六条）
+
+评审（维护者 yhwlwl）在独立环境里逐条复现，全部已修，并各自补了真实执行测试（见 [testing.md](testing.md)）：
+
+1. **P1 迁移原样执行失败**：`array_agg(a.attname)` 是 `name[]`，与 `text[]` 字面量比较在解析期就报 `operator does not exist: name[] = text[]`（全新库也中招）→ 显式 `::text`。
+2. **P1 中继提前返回成功**：nodemailer 的 `sendMail(message, callback)` 第二参数是回调，传 `{ maxAttempts: 1 }` 让 `await` 拿到 `undefined`（HTTP 200 先于投递结果），随后库把该对象当回调调用，抛出 try/catch 之外的 `TypeError` → 只 await 一个 Promise。
+3. **P1 角色撤销后仍收到财务详情**：消费时只查 `active`/邮箱，不查当前身份 → 领取时用 `private.app_notify_recipient_allowed` 复核，不合格就地作废并计入「已作废」。
+4. **P2 跨版本重提重复发信**：队列存了 `application_version` 却不比较 → 版本不一致就作废。
+5. **P2 中断恢复绕过五次上限**：恢复路径只加 `attempts`，反复中断七轮仍是 `sending/attempts=6` → 恢复与投递失败共用 `p_max_attempts`，超龄的 `sending` 行直接丢弃。
+6. **P2 新增的 verify 脚本自己跑不起来**：`RAISE EXCEPTION '…' || queued` 语法非法；修完语法后"付款提醒恰好一封"的断言又与 main 已合入的"付款登记视同财委"冲突 → 改 `%` 占位符 + 按合格收件人集合断言，并新增身份撤销/失败上限/超龄 `sending` 的行为验证。
+
+评审同时确认"拒绝/已付款不发邮件"是 PR 明确声明的产品偏离、不算缺陷，但合并前需要维护者确认——这一条仍是**待维护者拍板的开放问题**。
+
+### 真实执行测试顺带抓出来的两条（评审没有看到）
+
+同一类问题在姊妹文件里还有一份、以及一处文档错误，都是新加的 PGlite 真实执行测试暴露的：
+
+- `20261005140000_email_notify_cron.verify.sql:26` 也有 `raise exception '…' || jobs`（PL/pgSQL 语法错误）。它平时只在装了 pg_cron 的分支才会被执行，但**整个 `DO` 块在首次执行时就会被解析**，所以缺扩展的环境同样会报——和评审在邮件迁移里发现的是同一个坑。
+- `docs/database-migrations.md` 与 README 的"空库从零建起"顺序写成了"先 4 份散装 SQL，再 `migrations/`"。空库上按这个顺序第一步就报 `relation "public.settings" does not exist`：散装 SQL 全是对既有表的 `alter`，那些表来自 `20260929130000_funds.sql` 与 `20260929180000_custom_app_users.sql`。两处已改成依赖驱动的真实顺序（基线段迁移 → 散装 SQL → 内置 admin → 邮件两条迁移 → verify），并以 `tests/sql-migrations.test.mjs` 作为可执行版本。

@@ -16,6 +16,9 @@ declare
   app_id uuid;
   queued integer;
   dup integer;
+  expected uuid[];
+  actual uuid[];
+  round_index integer;
   claim_1 uuid;
   claim_2 uuid;
   result jsonb;
@@ -93,13 +96,13 @@ begin
   update public.applications set status = 'draft', version = 1 where id = app_id;
   update public.applications set status = 'finance_pending', version = 1 where id = app_id;
   select count(*) into queued from public.notifications where application_id = app_id and event = '待财委审批' and recipient_user_id = finance_id;
-  if queued <> 1 then raise exception '同一版本同一事件应只保留一封，实际 ' || queued; end if;
+  if queued <> 1 then raise exception '同一版本同一事件应只保留一封，实际 %', queued; end if;
 
   -- 重新提交会升版本：同一事件应再次入队。
   update public.applications set status = 'draft', version = 2 where id = app_id;
   update public.applications set status = 'finance_pending', version = 2 where id = app_id;
   select count(*) into queued from public.notifications where application_id = app_id and event = '待财委审批' and recipient_user_id = finance_id;
-  if queued <> 2 then raise exception '新版本应重新入队，实际 ' || queued; end if;
+  if queued <> 2 then raise exception '新版本应重新入队，实际 %', queued; end if;
 
   -- 申请人自己要动手的两类：只发给申请人本人，不打扰审批人。
   update public.applications set status = 'changes_requested' where id = app_id;
@@ -110,8 +113,16 @@ begin
 
   -- 收款码被移除（payment_pending → payment_info_required）会把本轮的“待付款登记”提醒作废，
   -- 重新提交收款码后必须能再次提醒付款登记人（同一版本内允许第二次）。
-  -- 付款登记身份只有内置超级管理员能通过 cashier 判定，所以这里给它绑定邮箱当作收件人。
+  -- 合格收件人要用与实现同一处的判定函数推导，不能写死“恰好一封”：main 已合入“付款登记视同财委”，
+  -- 内置 admin（superadmin 判定）与已绑邮箱的财委都能通过 cashier 判定，各应收到一封。
   perform public.app_bind_email(super_id, super_id, 'verify-admin@example.com');
+  select coalesce(array_agg(u.id order by u.id), '{}'::uuid[]) into expected
+  from public.app_users u
+  where u.active and coalesce(u.email, '') <> '' and u.id <> owner_id
+    and private.app_user_has_role(u.id, 'cashier');
+  if not (super_id = any(expected)) then raise exception '前置条件失败：内置 admin 应通过付款登记身份判定'; end if;
+  if not (finance_id = any(expected)) then raise exception '付款登记视同财委：已绑邮箱的财委也应是合格收件人'; end if;
+
   update public.applications set status = 'payment_pending' where id = app_id;
   if not exists(select 1 from public.notifications where application_id = app_id and event = '待付款登记' and recipient_user_id = super_id and status = 'pending') then
     raise exception '进入待付款登记应提醒付款登记身份';
@@ -121,8 +132,28 @@ begin
     raise exception '移除收款码应作废本轮的待付款登记提醒';
   end if;
   update public.applications set status = 'payment_pending' where id = app_id;
-  select count(*) into queued from public.notifications where application_id = app_id and event = '待付款登记' and status <> 'cancelled';
-  if queued <> 1 then raise exception '重新提交收款码后应再次入队，实际 ' || queued; end if;
+  select coalesce(array_agg(recipient_user_id order by recipient_user_id), '{}'::uuid[]) into actual
+  from public.notifications
+  where application_id = app_id and event = '待付款登记' and status <> 'cancelled';
+  if actual is distinct from expected then
+    raise exception '重新提交收款码后应再次入队：每个合格收件人各一封（期望 %，实际 %）', expected, actual;
+  end if;
+
+  -- 消费前复核收件人身份（审查发现 P1-3）：撤销财委角色、账号仍启用时，指向他的待发提醒必须在领取时作废，
+  -- 不能因为“入队时有身份”就把申请标题与金额继续寄给已经没有查看权限的人。
+  perform public.app_set_member_roles(super_id, finance_id, array[]::text[], true);
+  if private.app_user_has_role(finance_id, 'finance') then raise exception '前置条件失败：财委角色应已撤销'; end if;
+  claim_1 := gen_random_uuid();
+  result := public.app_claim_notifications(claim_1, 200, 300, 24, 5);
+  if coalesce((result->>'cancelled')::integer, 0) < 1 then raise exception '撤销身份后应作废指向该收件人的提醒，实际作废 % 封', result->>'cancelled'; end if;
+  if exists(select 1 from public.notifications where application_id = app_id and recipient_user_id = finance_id
+            and status in ('pending','sending')) then
+    raise exception '撤销身份后不应再有指向该收件人的待发提醒';
+  end if;
+  if not exists(select 1 from public.notifications where application_id = app_id and recipient_user_id = finance_id
+                and status = 'cancelled' and last_error like '%不具备该待办的处理身份%') then
+    raise exception '身份撤销导致的作废应保留原因';
+  end if;
 
   -- 完结态没有需要动手的人：拒绝与已付款都不入队。
   update public.applications set status = 'rejected' where id = app_id;
@@ -131,27 +162,37 @@ begin
 
   -- 领取参数必须受约束。
   begin
-    perform public.app_claim_notifications(gen_random_uuid(), 0, 300, 24);
+    perform public.app_claim_notifications(gen_random_uuid(), 0, 300, 24, 5);
     raise exception '领取数量应被校验';
   exception when raise_exception then
     if sqlerrm not like '%领取数量无效%' then raise; end if;
   end;
+  begin
+    perform public.app_claim_notifications(gen_random_uuid(), 10, 300, 24, 0);
+    raise exception '失败重试上限应被校验';
+  exception when raise_exception then
+    if sqlerrm not like '%失败重试上限无效%' then raise; end if;
+  end;
 
   -- 把验证产生的行做得最老（仍在 24 小时窗口内），保证它们最先被领取，不受库里其它待发行影响。
+  -- 上面那次身份复核的领取会把本申请的待发行一起领成 sending，这里先原样退回 pending，
+  -- 否则下面的“本轮应领取 N 封”会退化成 0 == 0 的空断言。
+  update public.notifications set status = 'pending', claim_id = null, lease_expires_at = now()
+    where application_id = app_id and status = 'sending';
   update public.notifications set created_at = now() - interval '23 hours' where application_id = app_id and status = 'pending';
   select count(*) into queued from public.notifications where application_id = app_id and status = 'pending';
   claim_1 := gen_random_uuid();
-  result := public.app_claim_notifications(claim_1, 200, 300, 24);
+  result := public.app_claim_notifications(claim_1, 200, 300, 24, 5);
   -- 只比较本次验证产生的行：库里可能存在其它待发行，它们同样会被领取。
   select count(*) into dup from public.notifications where claim_id = claim_1 and application_id = app_id;
-  if dup <> queued then raise exception '本轮应领取本次验证产生的 ' || queued || ' 封，实际 ' || dup; end if;
+  if dup <> queued then raise exception '本轮应领取本次验证产生的 % 封，实际 %', queued, dup; end if;
   if exists(select 1 from public.notifications where claim_id = claim_1 and status <> 'sending') then raise exception '已领取的行必须处于发送中'; end if;
   if exists(select 1 from public.notifications where claim_id = claim_1 and lease_expires_at <= now()) then raise exception '领取必须带上未过期的租约'; end if;
   if exists(select 1 from public.notifications where application_id = app_id and status = 'pending' and next_attempt_at <= now()) then raise exception '到期的待发行应被本轮领走'; end if;
 
   -- 第二个批次不得重复拿到同一个 id（租约内不可见）。
   claim_2 := gen_random_uuid();
-  result := public.app_claim_notifications(claim_2, 200, 300, 24);
+  result := public.app_claim_notifications(claim_2, 200, 300, 24, 5);
   select count(*) into dup from public.notifications where claim_id = claim_1 and id in (
     select (element->>'id')::bigint from jsonb_array_elements(result->'rows') element
   );
@@ -160,15 +201,50 @@ begin
   -- 上一轮中断（租约过期）：重新排队并计入一次尝试。
   update public.notifications set lease_expires_at = now() - interval '1 minute' where claim_id = claim_1;
   claim_2 := gen_random_uuid();
-  result := public.app_claim_notifications(claim_2, 200, 300, 24);
+  result := public.app_claim_notifications(claim_2, 200, 300, 24, 5);
   if not exists(select 1 from public.notifications where claim_id = claim_2 and attempts = 1) then raise exception '中断批次应重新领取并计入一次尝试'; end if;
 
   -- 超龄提醒丢弃并保留原因：丢弃只针对待发送行，所以先把本轮发送中的行退回队列再压龄。
   update public.notifications set status = 'pending', created_at = now() - interval '30 days'
     where application_id = app_id and status in ('pending','sending');
-  result := public.app_claim_notifications(gen_random_uuid(), 200, 300, 24);
+  result := public.app_claim_notifications(gen_random_uuid(), 200, 300, 24, 5);
   if exists(select 1 from public.notifications where application_id = app_id and status in ('pending','sending')) then raise exception '超龄提醒不应继续留在队列'; end if;
   if not exists(select 1 from public.notifications where application_id = app_id and status = 'failed' and last_error like '%已丢弃') then raise exception '丢弃应保留原因'; end if;
+
+  -- 中断恢复同样执行失败上限（审查发现 P2-5）：反复“领取 → 租约过期”不能无限重领。
+  -- 旧版恢复路径只加 attempts 而领取时不再看上限，七轮之后仍停在 sending/attempts=6。
+  update public.applications set status = 'draft', version = 5 where id = app_id;
+  update public.applications set status = 'payment_info_required', version = 5 where id = app_id;
+  perform public.app_claim_notifications(gen_random_uuid(), 200, 300, 24, 5);
+  for round_index in 1..5 loop
+    update public.notifications set lease_expires_at = now() - interval '1 minute'
+      where application_id = app_id and status = 'sending';
+    perform public.app_claim_notifications(gen_random_uuid(), 200, 300, 24, 5);
+  end loop;
+  if exists(select 1 from public.notifications where application_id = app_id and status = 'sending') then
+    raise exception '反复中断不应让提醒一直停在发送中';
+  end if;
+  if not exists(select 1 from public.notifications where application_id = app_id and status = 'failed'
+                and attempts = 5 and last_error like '%次发送未完成，已停止重试%') then
+    raise exception '中断恢复应在尝试次数用满后判失败';
+  end if;
+
+  -- 超龄的发送中行恢复时不能走“普通中断”那条路被退回队列、又在同一轮寄出。
+  -- 要同时满足“超龄”与“租约已过期”，才会走进恢复分支。
+  update public.applications set status = 'draft', version = 6 where id = app_id;
+  update public.applications set status = 'payment_info_required', version = 6 where id = app_id;
+  perform public.app_claim_notifications(gen_random_uuid(), 200, 300, 24, 5);
+  select count(*) into queued from public.notifications where application_id = app_id and status = 'failed' and last_error like '%小时未发送，已丢弃%';
+  update public.notifications set created_at = now() - interval '30 days', lease_expires_at = now() - interval '1 minute'
+    where application_id = app_id and status = 'sending';
+  perform public.app_claim_notifications(gen_random_uuid(), 200, 300, 24, 5);
+  if exists(select 1 from public.notifications where application_id = app_id and status in ('pending','sending')) then
+    raise exception '超龄的发送中行恢复后不应继续留在队列：%', (select string_agg(id || ':' || event || ':v' || application_version || ':' || status || ':' || attempts, ', ')
+      from public.notifications where application_id = app_id and status in ('pending','sending'));
+  end if;
+  if (select count(*) from public.notifications where application_id = app_id and status = 'failed' and last_error like '%小时未发送，已丢弃%') <= queued then
+    raise exception '超龄的发送中行恢复时应记为已丢弃';
+  end if;
 
   -- 永久失败可以重新排队；但只有管理员可以。
   perform public.app_reset_failed_notifications(super_id);
@@ -179,6 +255,25 @@ begin
   exception when raise_exception then
     if sqlerrm not like '%没有管理员权限%' then raise; end if;
   end;
+
+  -- 跨版本重提（审查发现 P2-4）：重置把各版本的失败行都退回了队列，此时申请是 version = 6，
+  -- 队列里 v2/v5 的提醒都是"上一版待办"。这些行的 created_at 还停在上一段的 30 天前，
+  -- 先把它们拉回时间窗内，让本段只考察"版本"这一条规则，而不是又被超龄丢弃抢先处理。
+  update public.notifications set created_at = now() where application_id = app_id and status = 'pending';
+  perform public.app_claim_notifications(gen_random_uuid(), 200, 300, 24, 5);
+  if exists(select 1 from public.notifications where application_id = app_id
+            and application_version <> 6 and status <> 'cancelled') then
+    raise exception '版本不一致的旧提醒应在领取时作废：%', (select string_agg(id || ':' || event || ':v' || application_version || ':' || status || ':' || attempts, ', ')
+      from public.notifications where application_id = app_id and application_version <> 6 and status <> 'cancelled');
+  end if;
+  if not exists(select 1 from public.notifications where application_id = app_id
+                and application_version <> 6 and status = 'cancelled' and last_error like '%申请已重新提交（版本%') then
+    raise exception '版本作废应保留原因';
+  end if;
+  if not exists(select 1 from public.notifications where application_id = app_id
+                and application_version = 6 and status = 'sending') then
+    raise exception '当前版本的提醒不应被误作废';
+  end if;
 
   update public.settings set email_notify_enabled = false where id = 1;
 end $$;

@@ -1,0 +1,359 @@
+// 用真实 PostgreSQL（PGlite，WASM）把仓库的整套 SQL 栈真的执行一遍。
+// 现有测试大多只做源码字符串断言，证明了"SQL 长什么样"，证明不了"SQL 能跑"：
+// 20261004210000_email_notify.sql 里 name[] = text[] 那条路径就是在真实解析时才暴露的。
+// 本文件按 docs/database-migrations.md 的执行顺序逐文件执行，失败时把文件路径与原始报错一起抛出。
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { readFileSync, readdirSync, existsSync } from 'node:fs';
+import path from 'node:path';
+import { PGlite } from '@electric-sql/pglite';
+import { pgcrypto } from '@electric-sql/pglite/contrib/pgcrypto';
+
+const ROOT = import.meta.dirname ? path.dirname(import.meta.dirname) : process.cwd();
+const SQL_ROOT = path.join(ROOT, 'supabase');
+const rel = (absolute) => path.relative(ROOT, absolute).split(path.sep).join('/');
+const read = (absolute) => readFileSync(absolute, 'utf8');
+const TIMEOUT = 120000;
+
+// 真实的 Supabase 里 auth/storage schema 与 anon/authenticated/service_role 角色由平台提供，
+// PGlite 里没有。这里只建"让迁移里的建表、建策略、授权语句能解析"的最小占位，不模拟任何 Supabase 行为。
+const PLATFORM_PLACEHOLDER = `
+do $$
+begin
+  if not exists(select 1 from pg_roles where rolname = 'anon') then create role anon nologin; end if;
+  if not exists(select 1 from pg_roles where rolname = 'authenticated') then create role authenticated nologin; end if;
+  if not exists(select 1 from pg_roles where rolname = 'service_role') then create role service_role nologin; end if;
+end $$;
+
+create schema if not exists auth;
+create schema if not exists storage;
+
+-- 迁移里的 on_auth_user_created 触发器与 handle_new_user() 用到 id/email/raw_user_meta_data。
+create table if not exists auth.users (
+  id uuid primary key default gen_random_uuid(),
+  email text,
+  raw_user_meta_data jsonb not null default '{}'::jsonb
+);
+-- 20260929130000_funds.sql 的旧 RLS 策略直接调用 auth.uid()；这里只要能被解析。
+create or replace function auth.uid() returns uuid language sql stable as $$ select null::uuid $$;
+
+-- 20260929130000_funds.sql 会往 storage.buckets 插 bucket，并在 storage.objects 上建策略与 revoke。
+create table if not exists storage.buckets (
+  id text primary key,
+  name text not null,
+  public boolean not null default false,
+  file_size_limit bigint,
+  allowed_mime_types text[]
+);
+create table if not exists storage.objects (
+  id uuid primary key default gen_random_uuid(),
+  bucket_id text references storage.buckets(id),
+  name text,
+  owner uuid,
+  created_at timestamptz not null default now()
+);
+alter table storage.objects enable row level security;
+`;
+
+// supabase/migrations 下按 14 位时间戳升序的全部迁移（不含 .verify.sql）。
+const MIGRATION_FILES = (() => {
+  const directory = path.join(SQL_ROOT, 'migrations');
+  const names = readdirSync(directory)
+    .filter((name) => name.endsWith('.sql') && !name.endsWith('.verify.sql'))
+    .sort();
+  return names.map((name) => path.join(directory, name));
+})();
+
+// docs/database-migrations.md / README「执行顺序」把四份散装 SQL 排在最前，因为真实的 Supabase 项目上它们是
+// 早期在 Dashboard 的 SQL 编辑器里手工执行过的，那时 20260929130000_funds.sql 早已按账本应用过。PGlite 是空库，
+// 这里只是把同一个依赖链按真实的可执行顺序摆出来，没有改写任何仓库 SQL：
+//   1) 基线迁移 20260929130000_funds.sql（建 profiles/user_roles/settings/applications/... 与 storage bucket）
+//      与 20260929180000_custom_app_users.sql（建 app_users/app_sessions）——散装 SQL 全是对既有表的 alter。
+//   2) 四份散装 SQL（private.app_insert_user、public.app_list_members、显式提交等）。
+//   3) 时间戳更大的迁移：20261004210000_email_notify.sql 开头的 fail-fast 明确要求散装 SQL 先执行。
+// 顺序错了会直接报"缺少 private.app_insert_user"——这正是本条用例要真实覆盖的那道 fail-fast。
+const BULK_FILES = [
+  path.join(SQL_ROOT, 'admin-settings-audit.sql'),
+  path.join(SQL_ROOT, 'member-management-and-resubmission.sql'),
+  path.join(SQL_ROOT, 'detailed-file-and-review-audit.sql'),
+  path.join(SQL_ROOT, 'explicit-submission.sql'),
+];
+// 散装 SQL 依赖的基线段：建出它们要修改的表。20261002133000 与 20261005010000 只重定义 private.app_user_has_role，
+// 放在散装 SQL 之前更贴近"库里本来就有完整账本"的真实状态。
+const BASELINE_MIGRATIONS = MIGRATION_FILES.filter((file) => {
+  const name = path.basename(file);
+  return /^(20260929130000|20260929130500|20260929180000|20260929181000|20260929190000|20261002133000|20261005010000)_/.test(name);
+});
+// 执行顺序：基线段 → 四份散装 SQL → 内置 admin → 其余迁移 → 全部 verify（每个文件只执行一次）。
+// 其余迁移（含 20261004210000_email_notify.sql）必须排在散装 SQL 之后：它的开头有一道 fail-fast，
+// 缺 private.app_insert_user 会直接报"请先执行 supabase/admin-settings-audit.sql"。
+const LATE_MIGRATIONS = MIGRATION_FILES.filter((file) => !BASELINE_MIGRATIONS.includes(file));
+// 散装 SQL 的 verify 脚本（admin-settings-audit.verify.sql、member-management-and-resubmission.verify.sql、
+// 20261002133000_*.verify.sql、20261005010000_*.verify.sql、explicit-submission.verify.sql）都以
+// "内置 admin 账号存在" 为前置条件（"built-in admin is required"），但它们只按角色去取这个账号，不负责创建。
+// 空库上没有它，这些 verify 必然报错（典型现象：member-management 的 "admin role deletion allowed"——
+// super_id 取不到，删角色自然不会触发守卫）。所以这里按仓库注释里写的部署动作补出这个账号：
+// 先用基线段已有的 app_users 表建号（private.app_insert_user），再补上 admin 角色。
+// 位置是唯一的可插入点：member-management-and-resubmission.sql 会装上 private.protect_builtin_admin 触发器，
+// 之后任何给 admin 账号补角色的语句都会被它按"admin 的权限已锁定，任何用户都不能修改"拒掉；
+// 而 private.app_insert_user 又只在 admin-settings-audit.sql 里定义，所以只能排在两者之间。
+// 建号后把注册开关关回去，保持与生产默认值（关闭注册）一致。
+const ADMIN_FIXTURE = `
+do $$
+declare super_id uuid;
+begin
+  select id into super_id from public.app_users where lower(username) = 'admin';
+  if super_id is null then
+    super_id := (private.app_insert_user('admin', 'Admin-only-1369666', '内置管理员', '管理') ->> 'id')::uuid;
+    insert into public.user_roles(user_id, role) values (super_id, 'admin');
+  end if;
+  update public.settings set registration_enabled = false where id = 1;
+end $$;
+`;
+// 每个结构文件之后执行同名 .verify.sql；verify 脚本自己包在 begin; … rollback; 里，这里统一在结构加载完、
+// 内置 admin 建好之后跑。
+const VERIFY_FILES = [
+  ...BULK_FILES.map((file) => file.replace(/\.sql$/, '.verify.sql')),
+  ...MIGRATION_FILES.map((file) => file.replace(/\.sql$/, '.verify.sql')),
+].filter(existsSync);
+const EXECUTION_ORDER = [...BASELINE_MIGRATIONS, ...BULK_FILES, ...LATE_MIGRATIONS, ...VERIFY_FILES];
+
+function failure(file, error) {
+  const lines = [`执行 ${rel(file)} 失败`, `原始报错：${error.message}`];
+  if (error.position) lines.push(`位置：${error.position}`);
+  if (error.detail) lines.push(`detail：${error.detail}`);
+  if (error.hint) lines.push(`hint：${error.hint}`);
+  if (error.where) lines.push(`where：${error.where}`);
+  const wrapped = new Error(lines.join('\n'));
+  wrapped.cause = error;
+  return wrapped;
+}
+
+// 整个栈只建一次、只跑一次：内存 PGlite 实例较慢，多个用例共享同一次真实执行结果。
+let bootstrapPromise;
+const executed = [];
+function bootstrap() {
+  bootstrapPromise ??= (async () => {
+    const db = new PGlite({ extensions: { pgcrypto } });
+    db.waitReady.catch(() => {});
+    const runFile = async (file) => {
+      const startedAt = Date.now();
+      try {
+        await db.exec(read(file));
+      } catch (error) {
+        throw failure(file, error);
+      }
+      executed.push({ file: rel(file), ms: Date.now() - startedAt });
+    };
+    try {
+      await db.exec(PLATFORM_PLACEHOLDER);
+      for (const file of BASELINE_MIGRATIONS) await runFile(file);
+      // admin-settings-audit.sql 提供 private.app_insert_user、加出 registration_enabled 列；
+      // member-management-and-resubmission.sql 会装上锁死 admin 的触发器。内置 admin 必须夹在这两者之间建。
+      await runFile(BULK_FILES[0]);
+      await db.exec(ADMIN_FIXTURE);
+      for (const file of BULK_FILES.slice(1)) await runFile(file);
+      for (const file of LATE_MIGRATIONS) await runFile(file);
+      for (const file of VERIFY_FILES) await runFile(file);
+    } catch (error) {
+      // 起不来的实例留着只会拖住事件循环。
+      await db.close().catch(() => {});
+      throw error;
+    }
+    return db;
+  })();
+  return bootstrapPromise;
+}
+
+test('真实 PostgreSQL 能按文档顺序跑完整套 SQL 栈（4 份散装 SQL + 全部迁移 + 全部 verify）', { timeout: TIMEOUT }, async () => {
+  const db = await bootstrap();
+  assert.ok(db, 'PGlite 实例应可用');
+
+  // 每个文件都真的跑过、恰好一次，且顺序与 EXECUTION_ORDER 完全一致（迁移升序在前，散装 SQL 与 verify 在后）。
+  const names = executed.map((item) => item.file);
+  assert.deepEqual(names, EXECUTION_ORDER.map(rel));
+  assert.equal(new Set(names).size, names.length, `同一个文件不应执行两次：${names.join('、')}`);
+
+  const migrationNames = MIGRATION_FILES.map(rel);
+  const bulkNames = BULK_FILES.map(rel);
+  const verifyNames = VERIFY_FILES.map(rel);
+  assert.deepEqual([...migrationNames].sort(), migrationNames, '迁移文件清单必须按文件名时间戳升序');
+  // 全部迁移都要执行到，且每条迁移内部保持时间戳先后（基线段 → 散装 SQL → 新迁移）。
+  const executedMigrations = names.filter((name) => migrationNames.includes(name));
+  assert.deepEqual([...executedMigrations].sort(), migrationNames, '每条迁移都应执行且只执行一次');
+  assert.ok(
+    names.indexOf('supabase/migrations/20261004210000_email_notify.sql') > names.indexOf('supabase/admin-settings-audit.sql'),
+    'email_notify 迁移必须排在散装 SQL 之后，否则它的 fail-fast 会直接报"缺少 private.app_insert_user"',
+  );
+  assert.ok(migrationNames.length >= 9, `迁移文件数异常：${migrationNames.length}`);
+  assert.equal(bulkNames.length, 4, 'docs 列出的四份散装 SQL 都应执行');
+  // 有同名 .verify.sql 的文件，它的 verify 必须被执行到；反之 verify 清单里不能出现孤儿。
+  // 早期迁移（20260929*）本来就没有 verify，所以这里只校验"存在就必须跑"，不要求每个文件都有。
+  for (const structure of [...migrationNames, ...bulkNames]) {
+    const verify = structure.replace(/\.sql$/, '.verify.sql');
+    if (existsSync(path.join(ROOT, verify))) {
+      assert.ok(verifyNames.includes(verify), `${structure} 有同名 verify 却没有被纳入执行清单`);
+    }
+  }
+  for (const name of verifyNames) {
+    assert.ok(names.includes(name), `verify 脚本未被执行：${name}`);
+    assert.ok(existsSync(path.join(ROOT, name)), `verify 清单里的文件不存在：${name}`);
+  }
+  assert.ok(verifyNames.length >= 7, `verify 文件数异常：${verifyNames.length}`);
+  for (const item of executed) assert.ok(item.ms >= 0, `${item.file} 未记录耗时`);
+});
+
+test('迁移执行后通知表、部分唯一索引与状态变化触发器真实存在', { timeout: TIMEOUT }, async () => {
+  const db = await bootstrap();
+
+  const table = await db.query(`
+    select c.relkind, c.relrowsecurity
+    from pg_class c
+    where c.oid = to_regclass('public.notifications')
+  `);
+  assert.equal(table.rows.length, 1, 'public.notifications 表应存在');
+  assert.equal(table.rows[0].relkind, 'r');
+  assert.equal(table.rows[0].relrowsecurity, true, '通知表应开启行级安全');
+
+  // 去重由"部分唯一索引"承担：cancelled 的行不参与去重，所以不能是唯一约束。
+  const index = await db.query(`
+    select i.indisunique, i.indpred is not null as partial,
+           pg_get_indexdef(i.indexrelid) as definition
+    from pg_index i
+    where i.indexrelid = to_regclass('public.notifications_dedupe_idx')
+  `);
+  assert.equal(index.rows.length, 1, 'notifications_dedupe_idx 应存在');
+  assert.equal(index.rows[0].indisunique, true);
+  assert.equal(index.rows[0].partial, true, '去重索引必须是部分索引');
+  assert.match(index.rows[0].definition, /application_id, application_version, event, recipient_user_id/);
+  assert.match(index.rows[0].definition, /WHERE \(status <> 'cancelled'::text\)/);
+
+  const dedupeConstraints = await db.query(`
+    select count(*)::int as total from pg_constraint
+    where conrelid = 'public.notifications'::regclass and contype = 'u'
+  `);
+  assert.equal(dedupeConstraints.rows[0].total, 0, '不应再保留四列唯一约束');
+
+  const trigger = await db.query(`
+    select t.tgenabled, pg_get_triggerdef(t.oid) as definition
+    from pg_trigger t
+    where t.tgname = 'email_notify_status_change' and not t.tgisinternal
+  `);
+  assert.equal(trigger.rows.length, 1, 'email_notify_status_change 触发器应存在');
+  assert.match(trigger.rows[0].definition, /AFTER UPDATE OF status ON public\.applications/);
+  assert.match(trigger.rows[0].definition, /private\.enqueue_email_notification\(\)/);
+});
+
+test('public.app_claim_notifications 是本轮改动的五参数版本', { timeout: TIMEOUT }, async () => {
+  const db = await bootstrap();
+
+  const overloads = await db.query(`
+    select p.oid::regprocedure::text as signature,
+           pg_get_function_identity_arguments(p.oid) as identity_arguments,
+           pg_get_function_arguments(p.oid) as call_arguments
+    from pg_proc p
+    where p.pronamespace = 'public'::regnamespace and p.proname = 'app_claim_notifications'
+  `);
+  assert.equal(overloads.rows.length, 1, `应只剩一个重载，实际 ${overloads.rows.length} 个`);
+  const [claim] = overloads.rows;
+  // pg_get_function_identity_arguments 是 "参数名 类型" 的列表，类型是每段的最后一段。
+  const types = claim.identity_arguments.split(',').map((part) => part.trim().split(/\s+/).pop());
+  assert.equal(types.length, 5, `五参数签名，实际 ${types.length} 个：${claim.identity_arguments}`);
+  assert.deepEqual(types, ['uuid', 'integer', 'integer', 'integer', 'integer']);
+  assert.match(claim.call_arguments, /p_max_attempts integer DEFAULT 5$/, '第五个参数应带默认值，兼容四参数调用方');
+
+  // 旧的四参数版本必须已被 drop 掉，否则 PostgREST 命名参数调用会有歧义。
+  const fourArgs = await db.query(`
+    select count(*)::int as total from pg_proc
+    where pronamespace = 'public'::regnamespace and proname = 'app_claim_notifications'
+      and pronargs = 4
+  `);
+  assert.equal(fourArgs.rows[0].total, 0, '四参数旧版本不应残留');
+
+  // 真实调用一次：五参数与四参数（走 default）都应能跑通。
+  const viaDefault = await db.query(
+    `select public.app_claim_notifications(gen_random_uuid(), 10, 300, 24) as result`,
+  );
+  assert.equal(typeof viaDefault.rows[0].result, 'object');
+  assert.ok('claimed' in viaDefault.rows[0].result);
+});
+
+test('原样执行 20261004210000_email_notify.sql 不报错，且 name[] = text[] 那条路径确实被解析过', { timeout: TIMEOUT }, async () => {
+  const db = await bootstrap();
+
+  // 断言 1：迁移已被逐字执行过（见第一条用例的文件清单），这里再单独原样跑一次，确认可重复执行。
+  const migration = path.join(SQL_ROOT, 'migrations', '20261004210000_email_notify.sql');
+  await db.exec(read(migration));
+
+  // 迁移里那段 do $$ ... pg_attribute.attname::text ... = array[...] 的等价查询，新写法必须能跑。
+  const newForm = await db.query(`
+    select c.conname
+    from pg_constraint c
+    where c.conrelid = 'public.notifications'::regclass and c.contype = 'u'
+      and (
+        select array_agg(a.attname::text order by a.attname)
+        from unnest(c.conkey) as k(attnum)
+        join pg_attribute a on a.attrelid = c.conrelid and a.attnum = k.attnum
+      ) = array['application_id','application_version','event','recipient_user_id']
+  `);
+  assert.equal(newForm.rows.length, 0);
+
+  // 断言 2：同一条查询不显式转 text 就会在解析期炸——说明本用例真的能抓到被修掉的那个 bug。
+  let oldFormError;
+  try {
+    await db.query(`
+      select c.conname
+      from pg_constraint c
+      where c.conrelid = 'public.notifications'::regclass and c.contype = 'u'
+        and (
+          select array_agg(a.attname order by a.attname)
+          from unnest(c.conkey) as k(attnum)
+          join pg_attribute a on a.attrelid = c.conrelid and a.attnum = k.attnum
+        ) = array['application_id','application_version','event','recipient_user_id']
+    `);
+  } catch (error) {
+    oldFormError = error;
+  }
+  assert.ok(oldFormError, '不转 text 的旧写法必须报错，否则本用例抓不到这个 bug');
+  assert.match(oldFormError.message, /operator does not exist: name\[\] = text\[\]/);
+});
+
+test('verify 脚本真的驱动了数据变化：admin 前置账号由仓库函数建出且内置账号受保护', { timeout: TIMEOUT }, async () => {
+  const db = await bootstrap();
+
+  const admin = await db.query(`
+    select u.id, u.username, u.active, u.password_hash like '$2%' as hashed,
+           (select count(*)::int from public.user_roles r where r.user_id = u.id and r.role = 'admin') as admin_roles,
+           (select count(*)::int from public.profiles p where p.id = u.id) as profiles
+    from public.app_users u where lower(u.username) = 'admin'
+  `);
+  assert.equal(admin.rows.length, 1, '内置 admin 前置账号应存在');
+  const [row] = admin.rows;
+  assert.equal(row.active, true);
+  assert.equal(row.admin_roles, 1);
+  assert.equal(row.profiles, 1, 'app_users 与 profiles 应一一对应');
+  assert.equal(row.hashed, true, '密码必须经 crypt() 哈希，明文不进库');
+
+  // 散装 SQL 的 verify 脚本全部回滚，不应在库里留下验证数据。
+  const leftovers = await db.query(`
+    select
+      (select count(*)::int from public.app_users where username like 'verify%') as users,
+      (select count(*)::int from public.applications where title like '%验证%') as applications,
+      (select count(*)::int from public.notifications) as notifications,
+      (select count(*)::int from public.applications) as all_applications
+  `);
+  assert.deepEqual(leftovers.rows[0], { users: 0, applications: 0, notifications: 0, all_applications: 0 });
+});
+
+test('PGlite 里没有 pg_cron，定时迁移按设计只提示不阻塞', { timeout: TIMEOUT }, async () => {
+  const db = await bootstrap();
+
+  const available = await db.query(`select count(*)::int as total from pg_available_extensions where name = 'pg_cron'`);
+  assert.equal(available.rows[0].total, 0, 'PGlite 不含 pg_cron，本用例覆盖的是"缺扩展时跳过"这条分支');
+
+  const registered = await db.query(`select public.app_register_email_cron() as result`);
+  assert.equal(typeof registered.rows[0].result, 'string');
+  assert.match(registered.rows[0].result, /^跳过：/, '缺扩展与未配置参数时只返回提示');
+  const cronSchema = await db.query(`select to_regclass('cron.job') as job`);
+  assert.equal(cronSchema.rows[0].job, null);
+});

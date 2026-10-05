@@ -47,13 +47,13 @@
 ## 队列用"带租约的原子领取"，语义是 at-least-once
 
 **背景**：管理员手动点「立即发送」和定时任务可能同时跑；函数被墙钟超时打断会留下半批。
-**决定**：`app_claim_notifications(批次号, 上限, 租约秒, 超龄小时)` 用 `FOR UPDATE SKIP LOCKED` 领取并写 `status='sending'` + `lease_expires_at`；写回必须同时匹配 `id` + `status='sending'` + `claim_id`；租约过期的 `sending` 行退回 `pending` 并计入一次尝试。
+**决定**：`app_claim_notifications(批次号, 上限, 租约秒, 超龄小时, 失败上限)` 用 `FOR UPDATE SKIP LOCKED` 领取并写 `status='sending'` + `lease_expires_at`；写回必须同时匹配 `id` + `status='sending'` + `claim_id`；租约过期的 `sending` 行退回 `pending` 并计入一次尝试，且这次恢复同样受失败上限约束（连续 5 次中断未完成就转 `failed`，不再无限重领）。
 **代价**：崩溃在"已发出但未写回"窗口内的邮件会重发一次。选择宁可重复、不可漏发。
 
 ## 超龄提醒丢弃而不是无限积压
 
 **背景**：开关关了一周再打开，会突然补发几天前的"待审批"邮件，收件人困惑且像故障。
-**决定**：领取时把 `pending` 且超过 24 小时的行标记为 `failed`，原因写明"超过 24 小时未发送，已丢弃"。
+**决定**：领取时把 `pending` 且超过 24 小时的行标记为 `failed`，原因写明"超过 24 小时未发送，已丢弃"；租约过期但同样超龄的 `sending` 行在恢复时就地丢弃，而不是先退回队列、再被同一轮寄出去。
 **代价**：长时间不开邮件服务会真的丢通知；但站内状态始终是对的，队列里也留着丢弃记录。
 
 ## 事件名、审计事件名用中文，并且是数据契约
@@ -84,6 +84,18 @@
 **背景**：入队与发送之间隔着 cron 周期、订阅开关、以及邮件服务故障时的退避重试（最长 24 小时）。这期间申请可能已经被处理、被撤回，或者换了收款人；不复核就会寄出"催办一件已经做完的事"，而且正文里的"当前状态"来自发送时刻，会和事件标题自相矛盾。
 **决定**：`app-api` 维护"事件 → 仍然要处理的状态"映射（与数据库触发器的 `CASE` 逐项一致，测试比对两边），领取后发送前核对一次；不一致就标记 `cancelled` 并记录当时的状态。这是在"不寄无用邮件"与"不漏待办"之间选前者，因为状态已经变了就说明待办已由别人完成。
 **代价**：多一次映射表要跟触发器同步（契约测试盯着）；已经在 HTTP 调用中的那一封挡不住（窗口 ≤15 秒，不为此加锁）。
+
+## 领取时复核"人"与"版本"，而不只是状态
+
+**背景**：PR #19 的外部评审复现了两个漏洞。其一，财委在入队后被撤销角色（账号仍启用），消费时只检查收件人 `active` 与邮箱，于是申请标题与金额继续寄给一个在站内已经看不到它的人；其二，`finance_pending(v1) → changes_requested(v1) → finance_pending(v2)` 绕一圈回到同一状态，只比状态识别不出这是"上一版的旧待办"，同一财委会连收两封。
+**决定**：复核拆成三层。领取时（数据库侧，`app_claim_notifications`）复核两件队列级事实并就地作废不合格的 `pending` 行：① 收件人是否仍具备该待办身份（`private.app_notify_recipient_allowed`，内部仍只调 `private.app_user_has_role`）；② 队列行的 `application_version` 是否等于申请当前 `version`。发送前（`app-api` 侧）再复核两件可能在"领取之后"才变化的事实：③ 事件对应的状态是否仍然匹配，④ 版本是否又变了——和已有的 `active`/邮箱兜底放在一起。作废数由领取结果带回，计入管理面板的「已作废」，避免"数据库里作废了、面板上看不见"。
+**代价**：数据库多一个判定函数与两次队列清扫（量级：club 规模的队列，领取一次扫一遍 `pending`，可忽略）；规则在两处（SQL 与 handler）各写一遍，靠契约测试（`tests/email-notify.test.mjs`）与 PGlite 真实执行（`tests/sql-migrations.test.mjs`）盯住；作废是终态且不会自动复活——身份恢复后若待办没有再次变化，本人只能在站内看到；已在 HTTP 调用中的那一封仍然挡不住。
+
+## 让"能真实执行的测试"覆盖关键路径，而不是只做源码字符串断言
+
+**背景**：PR #19 的自述里 `npm test` 84 项全绿，但评审指出这些测试大多在读源码做字符串断言，于是同一批代码里两个必然失败的问题（迁移的 `name[] = text[]`、中继的 `sendMail` 第二参数）在测试里毫无痕迹。
+**决定**：能被真实执行的部分不再靠字符串——`tests/sql-migrations.test.mjs` 用 PGlite（真实 PostgreSQL 18 + pgcrypto WASM）按 `docs/database-migrations.md` 的顺序把散装 SQL、全部迁移与全部 `.verify.sql` 真跑一遍；`tests/mail-relay.test.mjs` 用真实 nodemailer + 自定义 transport 驱动真实的 HTTP handler，覆盖成功、失败、鉴权与限频。字符串契约断言保留，但只用于"多处必须同时成立"，并补上指向运行时测试的注释。
+**代价**：多两个 devDependencies（`@electric-sql/pglite`、`nodemailer`，都只在 `npm test` 里用，生产镜像不带）与一次 WASM 启动（秒级）；PGlite 与真实 Supabase 仍有差异（Edge Runtime、pg_cron、Storage 服务都不在里面），因此它证明的是"SQL 能执行且行为符合断言"，不是"生产环境验收"——后者仍需在测试项目上按 [database-migrations.md](database-migrations.md) 跑一遍。
 
 ## 限频与墙钟都按"暂停"处理，不消耗重试预算
 
