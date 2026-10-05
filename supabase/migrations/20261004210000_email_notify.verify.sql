@@ -18,6 +18,9 @@ declare
   dup integer;
   expected uuid[];
   actual uuid[];
+  events_now text[];
+  blocked_row bigint;
+  allowed_row bigint;
   round_index integer;
   claim_1 uuid;
   claim_2 uuid;
@@ -25,6 +28,11 @@ declare
 begin
   select email_notify_enabled into flag from public.settings where id = 1;
   if flag is distinct from false then raise exception '邮件通知总开关默认应为关闭'; end if;
+  -- 默认只开五类待办；拒绝申请与已付款是结果通知，默认关（管理员在设置里打开）。
+  select email_notify_events into events_now from public.settings where id = 1;
+  if events_now is distinct from array['待财委审批','待主席审批','退回修改','待补充收款码','待付款登记']::text[] then
+    raise exception '默认提醒类型应为五类待办，实际 %', events_now;
+  end if;
 
   select count(*) into trigger_count from pg_trigger
   where tgname = 'email_notify_status_change' and not tgisinternal;
@@ -273,6 +281,83 @@ begin
   if not exists(select 1 from public.notifications where application_id = app_id
                 and application_version = 6 and status = 'sending') then
     raise exception '当前版本的提醒不应被误作废';
+  end if;
+
+  -- 提醒类型配置（复审要求「交给管理员勾选」）：
+  -- 1) 结果类（拒绝申请/已付款）默认关的时候不入队（上面已断言），打开后应提醒申请人本人；
+  -- 2) 数组乱序、去重后按固定顺序保存；非枚举值被拒；只有管理员能改；
+  -- 3) 关掉某一类后，已经积压的该类提醒在领取时作废；
+  -- 4) 投递前复核函数把"领取之后被撤身份"的行挡下（handler 侧另有一条运行时测试）。
+  perform public.app_update_email_notify(super_id, true, array['已付款','拒绝申请','待付款登记']);
+  select email_notify_events into events_now from public.settings where id = 1;
+  if events_now is distinct from array['待付款登记','拒绝申请','已付款']::text[] then
+    raise exception '提醒类型应按固定顺序去重保存，实际 %', events_now;
+  end if;
+
+  update public.applications set status = 'draft', version = 7 where id = app_id;
+  update public.applications set status = 'rejected', version = 7 where id = app_id;
+  if not exists(select 1 from public.notifications where application_id = app_id and event = '拒绝申请' and recipient_user_id = owner_id) then
+    raise exception '打开结果通知后，拒绝申请应提醒申请人本人';
+  end if;
+  if exists(select 1 from public.notifications where application_id = app_id and event = '拒绝申请' and recipient_user_id <> owner_id) then
+    raise exception '拒绝申请只应发给申请人本人';
+  end if;
+  update public.applications set status = 'paid', version = 7 where id = app_id;
+  if not exists(select 1 from public.notifications where application_id = app_id and event = '已付款' and recipient_user_id = owner_id) then
+    raise exception '打开结果通知后，已付款应提醒申请人本人';
+  end if;
+
+  begin
+    perform public.app_update_email_notify(owner_id, true, array['拒绝申请']);
+    raise exception '普通成员不应能修改提醒设置';
+  exception when raise_exception then
+    if sqlerrm not like '%没有管理员权限%' then raise; end if;
+  end;
+  begin
+    perform public.app_update_email_notify(super_id, true, array['不存在的类型']);
+    raise exception '非法提醒类型应被拒绝';
+  exception when raise_exception then
+    if sqlerrm not like '%提醒类型无效%' then raise; end if;
+  end;
+
+  -- 单类关闭：先打开待财委审批并造一封积压提醒，再关掉该类型，领取时应作废而不是寄出。
+  perform public.app_update_email_notify(super_id, true, array['待财委审批','待主席审批','退回修改','待补充收款码','待付款登记','拒绝申请','已付款']);
+  perform public.app_set_member_roles(super_id, finance_id, array['finance'], true);
+  update public.applications set status = 'draft', version = 8 where id = app_id;
+  update public.applications set status = 'finance_pending', version = 8 where id = app_id;
+  if not exists(select 1 from public.notifications where application_id = app_id and application_version = 8 and event = '待财委审批' and status = 'pending') then
+    raise exception '打开待财委审批后应入队';
+  end if;
+  perform public.app_update_email_notify(super_id, true, array['待主席审批','退回修改','待补充收款码','待付款登记','拒绝申请','已付款']);
+  perform public.app_claim_notifications(gen_random_uuid(), 200, 300, 24, 5);
+  if exists(select 1 from public.notifications where application_id = app_id and application_version = 8 and event = '待财委审批' and status <> 'cancelled') then
+    raise exception '关闭类型后已积压的该类提醒应作废';
+  end if;
+  if not exists(select 1 from public.notifications where application_id = app_id and application_version = 8 and event = '待财委审批' and status = 'cancelled' and last_error like '%已关闭%') then
+    raise exception '关闭类型的作废应保留原因';
+  end if;
+
+  -- 投递前复核：领取之后再撤销身份（handler 里"领取后、投递前"的窗口），复核函数必须把这一行挡下。
+  perform public.app_update_email_notify(super_id, true, array['待财委审批','待主席审批','退回修改','待补充收款码','待付款登记','拒绝申请','已付款']);
+  perform public.app_set_member_roles(super_id, finance_id, array['finance'], true);
+  update public.applications set status = 'draft', version = 9 where id = app_id;
+  update public.applications set status = 'finance_pending', version = 9 where id = app_id;
+  select id into blocked_row from public.notifications
+   where application_id = app_id and application_version = 9 and event = '待财委审批' and recipient_user_id = finance_id;
+  select id into allowed_row from public.notifications
+   where application_id = app_id and application_version = 9 and event = '待财委审批' and recipient_user_id = super_id;
+  if blocked_row is null or allowed_row is null then raise exception '前置条件失败：财委与内置 admin 都应收到待审批提醒'; end if;
+  perform public.app_claim_notifications(gen_random_uuid(), 200, 300, 24, 5);
+  if not exists(select 1 from public.notifications where id = blocked_row and status = 'sending') then raise exception '前置条件失败：待审批提醒应已被领取'; end if;
+  perform public.app_set_member_roles(super_id, finance_id, array[]::text[], true);
+  result := public.app_notify_blocked_rows(array[blocked_row]);
+  if not exists(select 1 from jsonb_array_elements(result) e
+                where (e->>'id')::bigint = blocked_row and e->>'reason' like '%不具备该待办的处理身份%') then
+    raise exception '领取后撤销身份的行应被投递前复核挡下，实际 %', result;
+  end if;
+  if exists(select 1 from jsonb_array_elements(public.app_notify_blocked_rows(array[allowed_row])) e
+            where (e->>'id')::bigint = allowed_row) then
+    raise exception '身份仍有效的行不应被投递前复核挡下';
   end if;
 
   update public.settings set email_notify_enabled = false where id = 1;

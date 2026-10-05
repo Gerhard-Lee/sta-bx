@@ -48,7 +48,8 @@
 ## 停用与登录
 
 - `app_users.active = false` → `app_user_has_role`/`app_user_active` 全部返回 false，并且 `app_set_member_roles` 会顺手删掉该用户所有会话；已登录的令牌在下一次请求时以 403「账号已停用。」失效。
-- 停用成员的邮箱**不再收到新邮件**：入队时过滤 `u.active`，发送时再查一次 `active`（否则会把提醒发给已经离开的成员）。
+- 停用成员的邮箱**不再收到新邮件**：入队时过滤 `u.active`，领取时用 `private.app_notify_recipient_allowed` 再核一次，**每个发送组投递前**还会通过 `app_notify_blocked_rows` 复核第三遍（领取之后才被停用/撤角色的行就地作废）。撤角色同理：身份一没，指向他的待发提醒不再寄出，见 [notifications.md](notifications.md#队列状态机与并发)。
+- `admin` 的**通知设置**权限指"总开关 + 七类提醒逐类勾选"（`app_update_email_notify`）：勾选只决定发不发，收件人仍由身份与申请归属推导，管理员不能借它指定任意收件人；改动写审计。
 
 ## 付款登记视同财委（已随 PR #15 合并）
 

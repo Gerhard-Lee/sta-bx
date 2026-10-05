@@ -59,7 +59,7 @@
 
 ## 12 `20261004210000_email_notify.sql` 被就地改写过
 
-该迁移在**未合并、从未部署**的分支上，因此审查修复时直接改了它三次：第一次新增 `sending` 状态、租约、事件集收窄；第二次新增 `cancelled` 终态、把去重唯一约束换成部分唯一索引、`app_bind_email` 改成三参数；第三次（PR #19 外部评审）修 `array_agg(a.attname)` 的 `name[] = text[]` 解析错误、加 `app_notify_recipient_allowed` 消费前身份复核与"版本已过期"作废、把 `app_claim_notifications` 改成五参数（失败上限）并让恢复路径也执行它。每次都保留了对旧结构收敛的 `alter` / `drop ... if exists` / 按函数名删重载的语句，因此对"已经执行过旧版"的库重跑本文件仍然有效。
+该迁移在**未合并、从未部署**的分支上，因此审查修复时直接改了它四次：第一次新增 `sending` 状态、租约、事件集收窄；第二次新增 `cancelled` 终态、把去重唯一约束换成部分唯一索引、`app_bind_email` 改成三参数；第三次（PR #19 外部评审）修 `array_agg(a.attname)` 的 `name[] = text[]` 解析错误、加 `app_notify_recipient_allowed` 消费前身份复核与"版本已过期"作废、把 `app_claim_notifications` 改成五参数（失败上限）并让恢复路径也执行它；第四次（复审）把事件集恢复为七类并加 `settings.email_notify_events` 逐类开关、领取时作废被关闭类型、新增 `app_notify_blocked_rows` 供投递前复核、`app_update_email_notify` 改成三参数。每次都保留了对旧结构收敛的 `alter` / `drop ... if exists` / 按函数名删重载的语句，因此对"已经执行过旧版"的库重跑本文件仍然有效。
 **如果有人已经在自己的库上执行过旧版本**：迁移账本与文件内容不一致，需要 `supabase migration repair` 或手工重跑该文件（它是幂等的）。
 
 ## 已修（本轮邮件审查的产出，留此备查）
@@ -83,7 +83,11 @@
 5. **P2 中断恢复绕过五次上限**：恢复路径只加 `attempts`，反复中断七轮仍是 `sending/attempts=6` → 恢复与投递失败共用 `p_max_attempts`，超龄的 `sending` 行直接丢弃。
 6. **P2 新增的 verify 脚本自己跑不起来**：`RAISE EXCEPTION '…' || queued` 语法非法；修完语法后"付款提醒恰好一封"的断言又与 main 已合入的"付款登记视同财委"冲突 → 改 `%` 占位符 + 按合格收件人集合断言，并新增身份撤销/失败上限/超龄 `sending` 的行为验证。
 
-评审同时确认"拒绝/已付款不发邮件"是 PR 明确声明的产品偏离、不算缺陷，但合并前需要维护者确认——这一条仍是**待维护者拍板的开放问题**。
+评审同时确认"拒绝/已付款不发邮件"是产品口径问题、不算缺陷，但合并前需要维护者拍板。
+
+### 复审（第二轮）后这条已按维护者建议解决
+
+维护者给的方案是"**保留完整提醒类型，在管理端让管理员勾选，不要把组织偏好写死**"。现在七类事件全部入库，`settings.email_notify_events` 逐类勾选（默认只开五类待办，拒绝申请/已付款默认关、需要时打开），总开关仍在；只有管理员能改、写审计；关掉某类后积压未投递的该类行会在领取时作废。**原来的产品分歧不再需要拍板**——口径变成配置。设计取舍见 [decisions.md](decisions.md) 的"提醒范围交给管理员配置"。
 
 ### 真实执行测试顺带抓出来的两条（评审没有看到）
 
@@ -91,3 +95,11 @@
 
 - `20261005140000_email_notify_cron.verify.sql:26` 也有 `raise exception '…' || jobs`（PL/pgSQL 语法错误）。它平时只在装了 pg_cron 的分支才会被执行，但**整个 `DO` 块在首次执行时就会被解析**，所以缺扩展的环境同样会报——和评审在邮件迁移里发现的是同一个坑。
 - `docs/database-migrations.md` 与 README 的"空库从零建起"顺序写成了"先 4 份散装 SQL，再 `migrations/`"。空库上按这个顺序第一步就报 `relation "public.settings" does not exist`：散装 SQL 全是对既有表的 `alter`，那些表来自 `20260929130000_funds.sql` 与 `20260929180000_custom_app_users.sql`。两处已改成依赖驱动的真实顺序（基线段迁移 → 散装 SQL → 内置 admin → 邮件两条迁移 → verify），并以 `tests/sql-migrations.test.mjs` 作为可执行版本。
+
+## 已修（PR #19 复审 / 第二轮的三条）
+
+复审确认上一轮六条全部修复（含"领取之前撤角色"的场景），另提三条，已全部处理：
+
+1. **提醒范围交给管理员配置**（原来是五类写死）→ 七类事件入库 + `settings.email_notify_events` 逐类勾选，默认只开五类待办；服务端校验枚举、规范化顺序、写审计；普通成员改不了；关掉的类型连积压的行也作废。
+2. **P1 领取后、投递前的身份缺口**（领取时复核过，但一轮 100 封 / 每组 5 封，后面的行可能等几十秒）→ 新增 `public.app_notify_blocked_rows(ids)`，`app-api` 在每个发送组之前再复核一次身份与类型开关，被挡下的就地作废；`tests/app-api-notify.test.mjs` 在真实 PGlite + 真实 handler 上复现"RPC 返回后撤角色"，断言 `sent: 0`。
+3. **P2 默认预算不适用于托管免费方案**（240 秒 > 官方 150 秒 worker 墙钟与 idle timeout）→ 默认降为 110 秒、`NOTIFY_MAX_RUNTIME_MS` 可覆盖（30 秒–15 分钟，自托管 compose 给 240 秒），并且每组之前判断"剩余时间够不够跑完这一组并收尾"，而不是只看是否大于 0。

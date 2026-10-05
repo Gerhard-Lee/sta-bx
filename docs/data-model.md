@@ -72,6 +72,7 @@ draft_value text               -- 收款人姓名或支付宝流水号的草稿�
 | `threshold` | 主席介入的金额门槛 | `100.00`，**恰好等于门槛需要主席审批**（判定是 `>=`） |
 | `registration_enabled` | 是否开放自助注册 | `true` |
 | `email_notify_enabled` | 邮件通知总开关 | `false` |
+| `email_notify_events` | 逐类提醒白名单（`text[]`，`<@` 七类事件枚举，顺序由 `app_update_email_notify` 规范化） | 五个待办类：待财委审批、待主席审批、退回修改、待补充收款码、待付款登记；拒绝申请/已付款默认关 |
 | `updated_at` / `updated_by` | 最后一次修改 | — |
 
 ## notifications（邮件队列）
@@ -79,7 +80,7 @@ draft_value text               -- 收款人姓名或支付宝流水号的草稿�
 ```
 id bigint identity pk
 application_id → applications (cascade) · application_version int
-event text  -- 五类"需要动手"事件之一
+event text  -- 七类事件之一：五个待办类 + 拒绝申请 / 已付款（结果通知）
 recipient_user_id → app_users (cascade)
 status text in (pending | sending | sent | failed | cancelled)
 attempts int check (>= 0) · next_attempt_at · lease_expires_at · claim_id uuid
@@ -92,7 +93,8 @@ last_error text · created_at · sent_at
 
 ```
 触发器入队 → pending ──app_claim_notifications（租约 + 批次号 + 超龄小时 + 失败上限）──► sending
-   pending ── 领取时复核收件人身份不合格（角色撤销/停用/解绑邮箱）或版本已过期 ──► cancelled（终态，不寄出）
+   pending ── 领取时复核不合格（身份撤销/停用/解绑邮箱、版本过期、该类型被管理员关闭）──► cancelled（终态，不寄出）
+   sending ── 每组投递前复核不合格（app_notify_blocked_rows：领取后撤身份/关类型）──► cancelled（终态，不寄出）
    sending ── 发送成功 ──► sent
    sending ── 状态已变（发送前复核失败）──► cancelled（终态，不寄出）
    sending ── HTTP 429 限频 ──► pending（按 Retry-After 延后，不计 attempts）

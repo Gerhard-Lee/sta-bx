@@ -20,29 +20,34 @@ function createAdmin(req: Request, requestId: string, action = '', actorId = '')
 }
 type AdminClient = ReturnType<typeof createAdmin>
 
-// 事件名必须与迁移 notifications.event 的 check 约束和触发器 CASE 分支保持一致。
-// 只在“需要有人动手”时发信：审批与付款登记类发给对应身份的成员，退回与补充收款码类发给申请人本人；
-// 拒绝、已付款等完结态没有待办，不发邮件。
+// 事件名必须与迁移 notifications.event 的 check 约束、settings.email_notify_events 的白名单和触发器 CASE 分支保持一致。
+// 五类"需要有人动手"的待办发给对应身份的成员或申请人本人；拒绝申请、已付款是结果通知，只发给申请人本人，
+// 默认不在 settings.email_notify_events 里（管理员可在设置里打开）。已撤回、草稿不发。
 const NOTIFY_EVENTS: Record<string, string> = {
   '待财委审批': '有新的申请等待财委审批',
   '待主席审批': '有新的申请等待主席审批',
   '退回修改': '您的申请被退回，请修改后重新提交',
   '待补充收款码': '您的申请已通过审批，请补充收款信息',
   '待付款登记': '有新的报销等待付款登记',
+  '拒绝申请': '您的申请未通过审批',
+  '已付款': '您的报销已完成打款',
 }
 const STATUS_LABELS: Record<string, string> = {
   draft: '草稿', finance_pending: '待财委审批', chair_pending: '待主席审批',
   changes_requested: '退回修改', rejected: '已拒绝', payment_info_required: '待补充收款码',
   payment_pending: '待付款', paid: '已付款', cancelled: '已撤回',
 }
-// 每个事件对应“仍然需要有人动手”的状态：领取之后、真正发送之前复核一次。
-// 状态已经变了（被别人处理、被撤回、收款人换了）就不要再催，直接把这封标记为已作废。
+// 每个事件对应“仍然成立”的状态：领取之后、真正发送之前复核一次。
+// 待办类状态变了（被别人处理、被撤回、收款人换了）就不再催；结果类（拒绝/已付款）是终态，
+// 复核只是防止“申请状态后来又被改动”这种异常，绝不会把新加的结果通知误判成过期。
 const NOTIFY_EVENT_STATUS: Record<string, string> = {
   '待财委审批': 'finance_pending',
   '待主席审批': 'chair_pending',
   '退回修改': 'changes_requested',
   '待补充收款码': 'payment_info_required',
   '待付款登记': 'payment_pending',
+  '拒绝申请': 'rejected',
+  '已付款': 'paid',
 }
 // 队列消费参数与 src/notify-rules.js 中的同名常量保持一致（Edge Function 无法直接引用前端模块）。
 const NOTIFY_BATCH = 100
@@ -53,9 +58,22 @@ const NOTIFY_LEASE_SECONDS = 300
 const NOTIFY_MAX_AGE_HOURS = 24
 const NOTIFY_MAX_ATTEMPTS = 5
 const NOTIFY_BACKOFF_CAP_MINUTES = 60
-// 一轮消费最多跑这么久：托管 Edge Functions 的墙钟上限是 150 秒（免费）/400 秒（付费），
-// 被墙钟杀掉会让剩余的行卡在“发送中”等租约到期。留出余量，时间用尽时把没动过的行原样退回队列。
-const NOTIFY_MAX_RUNTIME_MS = 240000
+// 一轮消费最多跑这么久。托管免费方案的 worker 墙钟上限与请求 idle timeout 都是 150 秒
+// （https://supabase.com/docs/guides/functions/limits），所以默认预算必须明显低于 150 秒：
+// 被平台硬杀的话，剩余的行会卡在“发送中”、按中断累加失败次数，正常积压也可能耗尽重试预算。
+// 自托管可以调大：环境变量 NOTIFY_MAX_RUNTIME_MS（毫秒），钳在 30 秒–15 分钟之间。
+const NOTIFY_MIN_RUNTIME_MS = 30000
+const NOTIFY_MAX_RUNTIME_LIMIT_MS = 900000
+const NOTIFY_DEFAULT_RUNTIME_MS = 110000
+const configuredRuntimeMs = Number(Deno.env.get('NOTIFY_MAX_RUNTIME_MS') ?? '')
+const NOTIFY_MAX_RUNTIME_MS = Number.isFinite(configuredRuntimeMs) && configuredRuntimeMs > 0
+  ? Math.min(Math.max(configuredRuntimeMs, NOTIFY_MIN_RUNTIME_MS), NOTIFY_MAX_RUNTIME_LIMIT_MS)
+  : NOTIFY_DEFAULT_RUNTIME_MS
+// 投递一个发送组（最多 5 封并发、单封 15 秒超时）加上写回，以及收尾时把没发送的行退回队列与写审计。
+// 每开始一组之前判断“剩下的时间够不够跑完这一组并收尾”，而不是只判断是否大于 0：
+// 否则最后一组会被平台掐断，那些行只能等租约到期、白吃一次尝试次数。
+const NOTIFY_GROUP_BUDGET_MS = NOTIFY_SEND_TIMEOUT_MS + 5000
+const NOTIFY_WRAPUP_BUDGET_MS = 20000
 // 邮件服务返回 429（限频）时暂停本轮、按 Retry-After 稍后重试：这是“等一等就好”，不消耗尝试次数，
 // 否则中继的每分钟限频会把正常积压误判成永久失败。
 const NOTIFY_THROTTLE_MIN_WAIT_SECONDS = 30
@@ -218,10 +236,12 @@ async function handle(req: Request) {
     const apiUrl = (Deno.env.get('EMAIL_API_URL') ?? '').trim()
     const apiKey = (Deno.env.get('EMAIL_API_KEY') ?? '').trim()
     const emailFrom = (Deno.env.get('EMAIL_FROM') ?? '').trim()
-    const { data: settingsRow, error: settingsError } = await admin.from('settings').select('email_notify_enabled').eq('id', 1).single()
+    const { data: settingsRow, error: settingsError } = await admin.from('settings').select('email_notify_enabled,email_notify_events').eq('id', 1).single()
     if (settingsError) throw new Error('通知设置读取失败。')
     // 开关优先于密钥：关闭时定时任务不应该因为没配邮件服务而反复失败刷日志。
     if (!settingsRow.email_notify_enabled) return ok({ sent: 0, failed: 0, retried: 0, cancelled: 0, deferred: 0, discarded: 0, skipped: true, rounds: 0, pending: 0, message: '总开关关闭，未发送邮件。' })
+    // 逐类开关由数据库在领取时执行（关掉的类型就地作废）；这里只记一份，用于审计与日志。
+    const enabledEvents: string[] = Array.isArray(settingsRow.email_notify_events) ? settingsRow.email_notify_events : []
     if (!apiUrl || !apiKey || !emailFrom) {
       if (actorId === null) return ok({ sent: 0, failed: 0, retried: 0, cancelled: 0, deferred: 0, discarded: 0, misconfigured: true, rounds: 0, pending: 0, message: '邮件服务尚未配置，本轮未发送。' })
       throw new HttpError('邮件服务尚未配置，请项目负责人为 app-api 配置 EMAIL_API_URL、EMAIL_API_KEY 与 EMAIL_FROM。', 503)
@@ -238,7 +258,7 @@ async function handle(req: Request) {
     let stop = false
     let throttleWait = 0
     while (rounds < NOTIFY_ROUNDS && !stop) {
-      if (timeLeft() <= 0) break
+      if (timeLeft() < NOTIFY_GROUP_BUDGET_MS + NOTIFY_WRAPUP_BUDGET_MS) break
       const claimId = crypto.randomUUID()
       const claim = await rpc('app_claim_notifications', { p_claim_id: claimId, p_limit: NOTIFY_BATCH, p_lease_seconds: NOTIFY_LEASE_SECONDS, p_max_age_hours: NOTIFY_MAX_AGE_HOURS, p_max_attempts: NOTIFY_MAX_ATTEMPTS })
       discarded += Number(claim?.discarded ?? 0)
@@ -274,6 +294,25 @@ async function handle(req: Request) {
         next_attempt_at: new Date(Date.now() + throttleWait * 1000).toISOString(),
         last_error: note.last_error || message,
       })
+      // 投递前最后一次复核（审查 P1）：领取之后到真正投递之间还隔着几秒到几十秒——一轮最多 100 封、
+      // 每组 5 封并发，后面的行可能等很久。管理员撤角色或关类型就发生在这个窗口里，而入库时的判定已经过期。
+      // 复核交给数据库（private.app_user_has_role + settings.email_notify_events），客户端不重写规则；
+      // 只返回"不该再发"的行与原因，被挡下的就地作废，不进入发送。
+      const recheckGroup = async (group: Record<string, any>[]) => {
+        if (!group.length) return group
+        const blocked = await rpc('app_notify_blocked_rows', { p_ids: group.map((note) => note.id) })
+        const reasons = new Map<number, string>((Array.isArray(blocked) ? blocked : []).map((row: Record<string, any>) => [Number(row.id), String(row.reason ?? '')]))
+        const allowed: Record<string, any>[] = []
+        for (const note of group) {
+          const reason = reasons.get(Number(note.id))
+          if (!reason) {
+            allowed.push(note)
+            continue
+          }
+          if (await settle(note, { status: 'cancelled', claim_id: null, last_error: reason.slice(0, 300) })) cancelled++
+        }
+        return allowed
+      }
       const sendOne = async (note: Record<string, any>) => {
         const app = apps.get(note.application_id)
         const recipient = users.get(note.recipient_user_id)
@@ -334,7 +373,8 @@ async function handle(req: Request) {
         }
         const attempts = note.attempts + 1
         if (!errorText) {
-          if (await settle(note, { status: 'sent', attempts, last_error: '', sent_at: new Date().toISOString() })) sent++
+          // 终态把批次号一起清掉：和 cancelled/failed/pending 保持一致，sent 行不再留着已经作废的租约批次。
+          if (await settle(note, { status: 'sent', attempts, claim_id: null, last_error: '', sent_at: new Date().toISOString() })) sent++
           return
         }
         if (attempts >= NOTIFY_MAX_ATTEMPTS) {
@@ -344,8 +384,11 @@ async function handle(req: Request) {
         if (await settle(note, { status: 'pending', attempts, last_error: errorText.slice(0, 300), next_attempt_at: new Date(Date.now() + Math.min(2 ** attempts, NOTIFY_BACKOFF_CAP_MINUTES) * 60000).toISOString() })) retried++
       }
       for (let index = 0; index < rows.length; index += NOTIFY_CONCURRENCY) {
-        if (timeLeft() <= 0 || throttleWait > 0) { stop = true; break }
-        await Promise.all(rows.slice(index, index + NOTIFY_CONCURRENCY).map(sendOne))
+        // 只有"剩下的时间够跑完这一组 + 收尾"才继续：否则最后一组会被平台墙钟掐断，
+        // 那些行只能等租约到期、白吃一次尝试次数。
+        if (timeLeft() < NOTIFY_GROUP_BUDGET_MS + NOTIFY_WRAPUP_BUDGET_MS || throttleWait > 0) { stop = true; break }
+        const group = await recheckGroup(rows.slice(index, index + NOTIFY_CONCURRENCY))
+        if (group.length) await Promise.all(group.map(sendOne))
       }
       if (stop) {
         // 限频或时间用尽：剩下的行（含本批还没轮到的那几个）原样退回队列，不消耗尝试次数。
@@ -360,7 +403,8 @@ async function handle(req: Request) {
     }
     const { count: pendingLeft, error: pendingError } = await admin.from('notifications').select('*', { count: 'exact', head: true }).eq('status', 'pending')
     if (pendingError) throw new Error('通知队列读取失败。')
-    await audit(actorId, '发送邮件提醒', `${actorId ? '管理员' : '定时任务'}处理 ${rounds} 轮：发送 ${sent} 封，失败 ${failed} 封，稍后重试 ${retried} 封，作废 ${cancelled} 封，本轮退回 ${deferred} 封，丢弃 ${discarded} 封，剩余待发送 ${pendingLeft ?? 0} 封`)
+    // 审计里写清本轮的预算与开启的提醒类型：配额上限与"管理员关了哪几类"是排查"为什么没收到"的第一手信息。
+    await audit(actorId, '发送邮件提醒', `${actorId ? '管理员' : '定时任务'}处理 ${rounds} 轮（预算 ${Math.round(NOTIFY_MAX_RUNTIME_MS / 1000)} 秒，已开启提醒类型 ${enabledEvents.length} 类）：发送 ${sent} 封，失败 ${failed} 封，稍后重试 ${retried} 封，作废 ${cancelled} 封，本轮退回 ${deferred} 封，丢弃 ${discarded} 封，剩余待发送 ${pendingLeft ?? 0} 封`)
     return ok({ sent, failed, retried, cancelled, deferred, discarded, rounds, pending: pendingLeft ?? 0 })
   }
 
@@ -549,7 +593,7 @@ async function handle(req: Request) {
     requireRole(actor, 'admin')
     const emailServiceReady = Boolean((Deno.env.get('EMAIL_API_URL') ?? '').trim() && (Deno.env.get('EMAIL_API_KEY') ?? '').trim() && (Deno.env.get('EMAIL_FROM') ?? '').trim())
     const [settingResult, auditResult, pendingResult, sendingResult, sentResult, failedResult, cancelledResult] = await Promise.all([
-      admin.from('settings').select('threshold,registration_enabled,email_notify_enabled').eq('id', 1).single(),
+      admin.from('settings').select('threshold,registration_enabled,email_notify_enabled,email_notify_events').eq('id', 1).single(),
       admin.from('audit_logs').select('*').order('created_at', { ascending: false }).order('id', { ascending: false }).limit(50),
       admin.from('notifications').select('*', { count: 'exact', head: true }).eq('status', 'pending'),
       admin.from('notifications').select('*', { count: 'exact', head: true }).eq('status', 'sending'),
@@ -578,6 +622,7 @@ async function handle(req: Request) {
       threshold: settingResult.data.threshold,
       registration_enabled: settingResult.data.registration_enabled,
       email_notify_enabled: settingResult.data.email_notify_enabled,
+      email_notify_events: Array.isArray(settingResult.data.email_notify_events) ? settingResult.data.email_notify_events : [],
       email_service_configured: emailServiceReady,
       notifications: { pending: pendingResult.count ?? 0, sending: sendingResult.count ?? 0, sent: sentResult.count ?? 0, failed: failedResult.count ?? 0, cancelled: cancelledResult.count ?? 0 },
       failures,
@@ -667,7 +712,12 @@ async function handle(req: Request) {
   if (action === 'update_email_notify') {
     requireRole(actor, 'admin')
     if (typeof body.enabled !== 'boolean') throw new HttpError('请选择是否启用邮件通知。')
-    await rpc('app_update_email_notify', { p_actor_id: actor.user.id, p_enabled: body.enabled })
+    // 提醒类型必须是数组：缺字段时宁可报错，也不要静默把已勾选的类型清空。
+    // 合法枚举与顺序由数据库规范化并校验（app_update_email_notify），前端传什么顺序都不影响判定。
+    if (!Array.isArray(body.events)) throw new HttpError('请选择要发送的提醒类型。')
+    const events = body.events.map((item) => String(item))
+    if (events.length > 7) throw new HttpError('提醒类型无效。')
+    await rpc('app_update_email_notify', { p_actor_id: actor.user.id, p_enabled: body.enabled, p_events: events })
     return ok(null)
   }
 

@@ -17,7 +17,7 @@
 | `20260929181000_custom_app_users_crypto_search_path.sql` | 给用到 pgcrypto 的三个函数补 `extensions` 搜索路径（否则 `crypt`/`gen_salt` 找不到） |
 | `20260929190000_admin_all_permissions.sql` | 一度把"拥有 `admin` 即视同所有流程身份"写进 `app_user_has_role`——**已被下一条推翻**，保留是因为迁移历史不可改写 |
 | `20261002133000_separate_admin_and_workflow_roles.sql` + verify | 管理员与流程身份分离；新增 `app_user_is_superadmin`，只有内置 `admin` 跨身份 |
-| `20261004210000_email_notify.sql` + verify | 邮箱绑定、通知队列与触发器、带租约的原子领取（五参数：批次号/上限/租约秒/超龄小时/失败上限）、消费前身份与版本复核、发送前状态复核与 `cancelled` 终态、依赖 fail-fast 检查 |
+| `20261004210000_email_notify.sql` + verify | 邮箱绑定、七类事件的通知队列与触发器、`settings.email_notify_events` 逐类开关、带租约的原子领取（五参数：批次号/上限/租约秒/超龄小时/失败上限）、领取时身份/版本/类型复核与 `app_notify_blocked_rows` 投递前复核、发送前状态复核与 `cancelled` 终态、依赖 fail-fast 检查 |
 | `20261005010000_finance_can_record_payment.sql` + verify | 付款登记视同财委身份：重定义 `private.app_user_has_role`，让 `finance` 通过 `cashier` 判定（PR #15 已合并）；通知触发器无需改动即继承新语义 |
 | `20261005140000_email_notify_cron.sql` + verify | 可选的 pg_cron 登记函数 `app_register_email_cron()`；缺扩展或未配置参数时只输出提示并跳过 |
 

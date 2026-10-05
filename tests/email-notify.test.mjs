@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { normalizeEmail, validateEmail, NOTIFY_EVENTS, NOTIFY_QUEUE, EMAIL_PATTERN, EMAIL_MAX } from '../src/notify-rules.js';
+import { normalizeEmail, validateEmail, NOTIFY_EVENTS, NOTIFY_DEFAULT_EVENTS, NOTIFY_EVENT_GROUPS, normalizeNotifyEvents, NOTIFY_QUEUE, EMAIL_PATTERN, EMAIL_MAX } from '../src/notify-rules.js';
 
 const source = (path) => readFileSync(path, 'utf8');
 const migration = source('supabase/migrations/20261004210000_email_notify.sql');
@@ -47,26 +47,45 @@ test('数据库邮箱规则与前端一致：254 长度和同一邮箱形态', (
   assert.equal((migration.match(/~\* '\^\[a-z0-9\._%\+\-\]\+@/g) ?? []).length, 3);
   assert.match(migration, /app_bind_email\(p_actor_id uuid, p_user_id uuid, p_email text\)[\s\S]{0,600}normalized !~\* '\^\[a-z0-9\._%\+\-\]\+@/);
 });
-test('邮件通知总开关默认关闭，且关闭时触发器不入队', () => {
+test('邮件通知总开关默认关闭，逐类勾选默认只开五类待办', () => {
   assert.match(migration, /email_notify_enabled boolean not null default false/);
-  assert.match(migration, /if not exists\(select 1 from public\.settings where id = 1 and email_notify_enabled\) then return null/);
+  assert.match(migration, /email_notify_events text\[\] not null default array\['待财委审批','待主席审批','退回修改','待补充收款码','待付款登记'\]/);
+  assert.match(migration, /email_notify_events <@ array\[/);
+  assert.match(migration, /if not exists\(select 1 from public\.settings where id = 1 and email_notify_enabled and target_event = any\(email_notify_events\)\) then return null/);
   assert.match(verify, /开关关闭时不应生成队列记录/);
+  assert.match(verify, /默认提醒类型应为五类待办/);
+  assert.deepEqual(NOTIFY_DEFAULT_EVENTS, ['待财委审批', '待主席审批', '退回修改', '待补充收款码', '待付款登记']);
+  // 缺字段（旧后端）回落到默认值；空数组是合法配置（管理员全部取消勾选），不能被当成缺字段。
+  assert.deepEqual(normalizeNotifyEvents(undefined), NOTIFY_DEFAULT_EVENTS);
+  assert.deepEqual(normalizeNotifyEvents('待付款登记'), NOTIFY_DEFAULT_EVENTS);
+  assert.deepEqual(normalizeNotifyEvents([]), []);
+  assert.deepEqual(normalizeNotifyEvents(['已付款', '不存在', '待财委审批', '已付款']), ['待财委审批', '已付款']);
 });
-test('只有“需要动手”的五类事件会发信，完结态不映射', () => {
-  assert.deepEqual(NOTIFY_EVENTS, ['待财委审批', '待主席审批', '退回修改', '待补充收款码', '待付款登记']);
+test('七类提醒与四处清单一致：待办五类 + 拒绝申请/已付款两个结果通知', () => {
+  assert.deepEqual(NOTIFY_EVENTS, ['待财委审批', '待主席审批', '退回修改', '待补充收款码', '待付款登记', '拒绝申请', '已付款']);
+  assert.deepEqual(NOTIFY_EVENTS.filter((event) => !NOTIFY_DEFAULT_EVENTS.includes(event)), ['拒绝申请', '已付款']);
   const mapping = slice(migration, 'target_event := case new.status', 'else null end');
-  assert.equal((mapping.match(/when '/g) ?? []).length, 5);
-  for (const done of ['rejected', 'paid', 'cancelled', 'draft']) assert.equal(new RegExp(`when '${done}' then`).test(migration), false, `完结态 ${done} 不应该映射成邮件事件`);
-  const sqlEvents = [...migration.matchAll(/when '(?:finance_pending|chair_pending|changes_requested|payment_info_required|payment_pending)' then '([^']+)'/g)].map((m) => m[1]);
+  assert.equal((mapping.match(/when '/g) ?? []).length, 7);
+  // 已撤回、草稿永远不发：既不是待办也不是结果。
+  for (const never of ['cancelled', 'draft']) assert.equal(new RegExp(`when '${never}' then`).test(migration), false, `${never} 不应该映射成邮件事件`);
+  const sqlEvents = [...migration.matchAll(/when '(?:finance_pending|chair_pending|changes_requested|payment_info_required|payment_pending|rejected|paid)' then '([^']+)'/g)].map((m) => m[1]);
   assert.deepEqual(sqlEvents, NOTIFY_EVENTS);
   const apiSlice = slice(api, 'const NOTIFY_EVENTS', 'const STATUS_LABELS');
   const apiEvents = [...apiSlice.matchAll(/'([^']+)': '/g)].map((m) => m[1]);
   assert.deepEqual(apiEvents, NOTIFY_EVENTS);
   const checkEvents = [...migration.matchAll(/event text not null check \(event in \(([^)]+)\)/g)][0][1];
   assert.deepEqual(checkEvents.split(',').map((item) => item.trim().replaceAll("'", '')), NOTIFY_EVENTS);
+  // 设置白名单、app-api 的"事件→仍然成立的状态"映射、管理端分组都必须是同一份名单、同一个顺序。
+  const settingsCheck = [...migration.matchAll(/email_notify_events <@ array\[([^\]]+)\]/g)][0][1];
+  assert.deepEqual(settingsCheck.split(',').map((item) => item.trim().replaceAll("'", '')), NOTIFY_EVENTS);
+  assert.deepEqual(NOTIFY_EVENT_STATUS_FROM_API().map(([event]) => event), NOTIFY_EVENTS);
+  assert.deepEqual(NOTIFY_EVENT_GROUPS.flatMap((group) => group.events), NOTIFY_EVENTS);
   assert.match(verify, /退回修改应提醒申请人本人/);
   assert.match(verify, /待补充收款码应提醒申请人本人/);
   assert.match(verify, /完结态不应生成队列记录/);
+  assert.match(verify, /打开结果通知后，拒绝申请应提醒申请人本人/);
+  assert.match(verify, /打开结果通知后，已付款应提醒申请人本人/);
+  assert.match(verify, /拒绝申请只应发给申请人本人/);
 });
 test('收件人由服务端按状态推导：审批事件给对应角色且跳过申请人本人', () => {
   assert.match(migration, /when '待财委审批' then u\.id <> new\.owner_id and private\.app_user_has_role\(u\.id, 'finance'\)/);
@@ -163,9 +182,14 @@ test('队列消费参数在前端、后端与数据库取值范围三方一致',
   assert.match(api, new RegExp(`const NOTIFY_MAX_AGE_HOURS = ${NOTIFY_QUEUE.maxAgeHours}\\b`));
   assert.match(api, new RegExp(`const NOTIFY_MAX_ATTEMPTS = ${NOTIFY_QUEUE.maxAttempts}\\b`));
   assert.match(api, new RegExp(`const NOTIFY_BACKOFF_CAP_MINUTES = ${NOTIFY_QUEUE.backoffCapMinutes}\\b`));
-  assert.match(api, new RegExp(`const NOTIFY_MAX_RUNTIME_MS = ${NOTIFY_QUEUE.maxRuntimeMs}\\b`));
-  // 一轮消费必须在 Edge Function 的墙钟上限（免费 150 秒 / 付费 400 秒）之内收尾。
-  assert.ok(NOTIFY_QUEUE.maxRuntimeMs > 0 && NOTIFY_QUEUE.maxRuntimeMs < 400000, '运行时长预算必须小于托管环境的墙钟上限');
+  // 预算：默认值必须明显低于托管免费方案的 150 秒墙钟与 idle timeout，并且可由服务端环境变量调大。
+  assert.match(api, new RegExp(`const NOTIFY_DEFAULT_RUNTIME_MS = ${NOTIFY_QUEUE.maxRuntimeMs}\\b`));
+  assert.ok(NOTIFY_QUEUE.maxRuntimeMs < 150000, '默认预算必须留在免费方案的 150 秒墙钟之内');
+  assert.ok(NOTIFY_QUEUE.maxRuntimeMs > NOTIFY_QUEUE.sendTimeoutMs * 3, '默认预算至少要够跑几个发送组');
+  assert.match(api, /Deno\.env\.get\('NOTIFY_MAX_RUNTIME_MS'\)/);
+  assert.match(api, /Math\.min\(Math\.max\(configuredRuntimeMs, NOTIFY_MIN_RUNTIME_MS\), NOTIFY_MAX_RUNTIME_LIMIT_MS\)/);
+  assert.match(api, /const NOTIFY_MIN_RUNTIME_MS = 30000/);
+  assert.match(api, /const NOTIFY_MAX_RUNTIME_LIMIT_MS = 900000/);
   assert.match(migration, /p_limit < 1 or p_limit > 200/);
   assert.match(migration, /p_lease_seconds < 30 or p_lease_seconds > 900/);
   assert.match(migration, /p_max_age_hours < 1 or p_max_age_hours > 168/);
@@ -228,23 +252,87 @@ test('开关关闭优先于密钥检查：定时任务不会因为没配邮件�
   assert.match(drain, /while \(rounds < NOTIFY_ROUNDS && !stop\)/);
   assert.match(drain, /rows\.slice\(index, index \+ NOTIFY_CONCURRENCY\)/);
 });
-test('一轮消费有时间预算：到点把没发送的行退回队列，不消耗尝试次数也不卡在发送中', () => {
+test('一轮消费有时间预算：每一组之前判断"够不够跑完这一组并收尾"，到点原样退回队列', () => {
   const drain = slice(api, 'const drainNotifications = async', "const { count: pendingLeft");
   assert.match(drain, /const timeLeft = \(\) => NOTIFY_MAX_RUNTIME_MS - \(Date\.now\(\) - startedAt\)/);
-  assert.match(drain, /if \(timeLeft\(\) <= 0\) break/);
-  assert.match(drain, /if \(timeLeft\(\) <= 0 \|\| throttleWait > 0\) \{ stop = true; break \}/);
+  // 只判断"> 0"不够：最后一组会被平台墙钟掐断，剩下的行只能等租约到期、白吃一次尝试次数。
+  assert.match(drain, /if \(timeLeft\(\) < NOTIFY_GROUP_BUDGET_MS \+ NOTIFY_WRAPUP_BUDGET_MS\) break/);
+  assert.match(drain, /if \(timeLeft\(\) < NOTIFY_GROUP_BUDGET_MS \+ NOTIFY_WRAPUP_BUDGET_MS \|\| throttleWait > 0\) \{ stop = true; break \}/);
+  assert.match(api, /const NOTIFY_GROUP_BUDGET_MS = NOTIFY_SEND_TIMEOUT_MS \+ 5000/);
+  assert.match(api, /const NOTIFY_WRAPUP_BUDGET_MS = 20000/);
+  assert.equal(/timeLeft\(\) <= 0/.test(drain), false, '不允许再只判断"> 0"');
   // 退回队列的行必须回到 pending、清掉批次号，并且不写 attempts。
-  const release = slice(drain, 'const release = (note', 'const sendOne = async');
+  const release = slice(drain, 'const release = (note', 'const recheckGroup = async');
   assert.match(release, /status: 'pending', claim_id: null/);
   assert.equal(/attempts:/.test(release), false, '退回队列不能消耗尝试次数');
   assert.match(drain, /const leftovers = rows\.filter\(\(note\) => !touched\.has\(note\.id\)\)/);
   assert.match(drain, /deferred \+= results\.filter\(Boolean\)\.length/);
   assert.match(drain, /本轮时间用尽，已退回队列/);
 });
+test('投递前复核每个发送组：领取之后被撤身份或关类型的行就地作废，不再寄出', () => {
+  const drain = slice(api, 'const drainNotifications = async', "const { count: pendingLeft");
+  // handler 侧：每组之前调用数据库复核，被挡下的行作废并计进"已作废"，合格的行才进入发送。
+  assert.match(drain, /const recheckGroup = async \(group: Record<string, any>\[\]\) => \{/);
+  assert.match(drain, /const blocked = await rpc\('app_notify_blocked_rows', \{ p_ids: group\.map\(\(note\) => note\.id\) \}\)/);
+  assert.match(drain, /if \(await settle\(note, \{ status: 'cancelled', claim_id: null, last_error: reason\.slice\(0, 300\) \}\)\) cancelled\+\+/);
+  assert.match(drain, /const group = await recheckGroup\(rows\.slice\(index, index \+ NOTIFY_CONCURRENCY\)\)/);
+  assert.match(drain, /if \(group\.length\) await Promise\.all\(group\.map\(sendOne\)\)/);
+  // 数据库侧：复核函数只返回"不该再发"的行与原因，判定复用身份函数与逐类开关。
+  assert.match(migration, /create or replace function public\.app_notify_blocked_rows\(p_ids bigint\[\]\)/);
+  assert.match(migration, /when not private\.app_notify_recipient_allowed\(n\.recipient_user_id, n\.event\)\s+then '收件人已不具备该待办的处理身份，提醒已作废'/);
+  assert.match(migration, /and n\.status = 'sending'\s+and blocked\.reason is not null/);
+  assert.match(migration, /revoke all on function public\.app_notify_blocked_rows\(bigint\[\]\) from public, anon, authenticated/);
+  assert.match(migration, /grant execute on function public\.app_notify_blocked_rows\(bigint\[\]\) to service_role/);
+  assert.match(verify, /领取后撤销身份的行应被投递前复核挡下/);
+  assert.match(verify, /身份仍有效的行不应被投递前复核挡下/);
+});
+test('提醒类型配置：逐类开关入库、非枚举值被拒、只有管理员能改、关闭后积压行作废', () => {
+  assert.match(migration, /create or replace function public\.app_update_email_notify\(p_actor_id uuid, p_enabled boolean, p_events text\[\]\)/);
+  assert.match(migration, /if p_events is null or exists\(\s+select 1 from unnest\(p_events\) e\s+where e is null or e not in \('待财委审批','待主席审批','退回修改','待补充收款码','待付款登记','拒绝申请','已付款'\)\) then\s+raise exception '提醒类型无效'/);
+  // 固定顺序 + 去重由服务端做，前端传什么顺序都不影响判定。
+  assert.match(migration, /unnest\(array\['待财委审批','待主席审批','退回修改','待补充收款码','待付款登记','拒绝申请','已付款'\]\) with ordinality/);
+  assert.match(migration, /set email_notify_enabled = p_enabled, email_notify_events = normalized/);
+  assert.match(migration, /values \(p_actor_id, '修改邮件通知设置',/);
+  assert.match(migration, /'提醒类型', jsonb_build_object\('原值', to_jsonb\(old_events\), '新值', to_jsonb\(normalized\)\)\)/);
+  // 换签名要先把旧重载删掉，否则 PostgREST 命名参数调用会有歧义。
+  assert.match(migration, /where n\.nspname = 'public' and p\.proname = 'app_update_email_notify'[\s\S]{0,120}drop function public\.%I\(%s\)/);
+  assert.match(migration, /revoke all on function public\.app_update_email_notify\(uuid, boolean, text\[\]\) from public, anon, authenticated/);
+  assert.match(migration, /grant execute on function public\.app_update_email_notify\(uuid, boolean, text\[\]\) to service_role/);
+  // 领取时关掉的类型就地作废（总开关关闭时不调用领取：app-api 直接返回 skipped）。
+  assert.match(migration, /where n\.status = 'pending'\s+and not exists\(select 1 from public\.settings s where s\.id = 1 and n\.event = any\(s\.email_notify_events\)\)/);
+  assert.match(migration, /'管理员已关闭「' \|\| n\.event \|\| '」提醒，本封已作废'/);
+  assert.match(migration, /cancelled := cancelled \+ disabled/);
+  // app-api：读配置、校验请求体、把事件数组透传给 RPC，并在管理数据里回传当前勾选。
+  assert.match(api, /admin\.from\('settings'\)\.select\('email_notify_enabled,email_notify_events'\)\.eq\('id', 1\)\.single\(\)/);
+  assert.match(api, /admin\.from\('settings'\)\.select\('threshold,registration_enabled,email_notify_enabled,email_notify_events'\)\.eq\('id', 1\)\.single\(\)/);
+  assert.match(api, /if \(!Array\.isArray\(body\.events\)\) throw new HttpError\('请选择要发送的提醒类型。'\)/);
+  assert.match(api, /await rpc\('app_update_email_notify', \{ p_actor_id: actor\.user\.id, p_enabled: body\.enabled, p_events: events \}\)/);
+  assert.match(api, /email_notify_events: Array\.isArray\(settingResult\.data\.email_notify_events\) \? settingResult\.data\.email_notify_events : \[\]/);
+  // verify：默认值、结果通知默认关 → 打开后入队、乱序规范化、普通成员/非法枚举被拒、单类关闭作废积压。
+  assert.match(verify, /默认提醒类型应为五类待办/);
+  assert.match(verify, /提醒类型应按固定顺序去重保存/);
+  assert.match(verify, /普通成员不应能修改提醒设置/);
+  assert.match(verify, /非法提醒类型应被拒绝/);
+  assert.match(verify, /关闭类型后已积压的该类提醒应作废/);
+  assert.match(verify, /关闭类型的作废应保留原因/);
+});
+test('管理端把提醒类型交给管理员勾选：总开关 + 分组逐类，保存时一起提交', () => {
+  assert.match(admin, /request\('update_email_notify', \{ enabled: emailNotify, events: emailEvents \}\)/);
+  assert.match(admin, /setEmailEvents\(normalizeNotifyEvents\(result\.data\.email_notify_events\)\)/);
+  assert.match(admin, /NOTIFY_EVENT_GROUPS\.map\(\(group\) => <div className="notify-event-group" key=\{group\.title\}>/);
+  assert.match(admin, /checked=\{emailEvents\.includes\(event\)\}/);
+  assert.match(admin, /setEmailEvents\(normalizeNotifyEvents\(e\.target\.checked \? \[\.\.\.emailEvents, event\] : emailEvents\.filter\(\(item\) => item !== event\)\)\)/);
+  assert.match(admin, /已勾选 \{emailEvents\.length\} \/ \{NOTIFY_EVENTS\.length\} 类提醒/);
+  assert.match(admin, /结果类（拒绝申请、已付款）只发给申请人本人，默认不勾选，需要时打开/);
+  assert.match(admin, /import \{ NOTIFY_QUEUE, NOTIFY_EVENTS, NOTIFY_DEFAULT_EVENTS, NOTIFY_EVENT_GROUPS, normalizeNotifyEvents \} from '\.\/notify-rules\.js';/);
+  assert.match(main, /是否收到邮件提醒由管理员在设置里配置/);
+  assert.match(main, /结果类（申请被拒绝、已完成打款）默认关闭/);
+});
 test('发送前复核状态：已经不处于待办状态的提醒改为作废，不再寄出', () => {
   assert.deepEqual(NOTIFY_EVENT_STATUS_FROM_API(), [
     ['待财委审批', 'finance_pending'], ['待主席审批', 'chair_pending'], ['退回修改', 'changes_requested'],
     ['待补充收款码', 'payment_info_required'], ['待付款登记', 'payment_pending'],
+    ['拒绝申请', 'rejected'], ['已付款', 'paid'],
   ]);
   const sendOne = slice(api, 'const sendOne = async', 'for (let index = 0;');
   assert.match(sendOne, /const expectedStatus = NOTIFY_EVENT_STATUS\[note\.event\]/);
@@ -357,16 +445,12 @@ test('管理数据的每个队列查询都要报错，不再静默显示 0 封',
 });
 test('管理端提供开关、五类队列统计、配置提示、失败明细与手动发送入口', () => {
   assert.ok(admin.includes('<h2>邮件通知</h2>'));
-  assert.match(admin, /request\('update_email_notify', \{ enabled: emailNotify \}\)/);
   assert.match(admin, /待发送 \{queue\.pending\} 封 · 发送中 \{queue\.sending\} 封 · 已发送 \{queue\.sent\} 封 · 失败 \{queue\.failed\} 封 · 已作废 \{queue\.cancelled\} 封/);
   assert.match(admin, /「已作废」表示提醒发出前申请状态已经变化/);
   assert.match(admin, /request\('send_notifications', \{\}\)/);
   assert.match(admin, /request\('reset_notifications', \{\}\)/);
   assert.match(admin, /data\.email_service_configured === false/);
   assert.match(admin, /邮箱（可选，用于接收待办提醒）/);
-  assert.match(admin, /开启后只在出现待办时入队/);
-  assert.match(main, /只在需要你动手时提醒/);
-  assert.match(admin, /import \{ NOTIFY_QUEUE \} from '\.\/notify-rules\.js';/);
 });
 test('后端未随前端一起部署时设置面板仍有兜底，不再整页白屏', () => {
   assert.equal(admin.includes('data.notifications.pending'), false);
@@ -390,7 +474,7 @@ test('账户入口不再只叫修改密码', () => {
 test('新表和新函数延续最小权限：RLS 加 service_role 专属执行', () => {
   assert.match(migration, /alter table public\.notifications enable row level security/);
   assert.match(migration, /revoke all on table public\.notifications from public, anon, authenticated/);
-  for (const fn of ['app_bind_email(uuid, uuid, text)', 'app_update_email_notify(uuid, boolean)', 'app_claim_notifications(uuid, integer, integer, integer, integer)', 'app_reset_failed_notifications(uuid)']) {
+  for (const fn of ['app_bind_email(uuid, uuid, text)', 'app_update_email_notify(uuid, boolean, text[])', 'app_claim_notifications(uuid, integer, integer, integer, integer)', 'app_notify_blocked_rows(bigint[])', 'app_reset_failed_notifications(uuid)']) {
     assert.ok(migration.includes(`revoke all on function public.${fn} from public, anon, authenticated;`));
     assert.ok(migration.includes(`grant execute on function public.${fn} to service_role;`));
   }
@@ -412,9 +496,14 @@ test('迁移行为验证真的驱动状态变化，而不是只看对象是否�
     '移除收款码应作废本轮的待付款登记提醒',
     '重新提交收款码后应再次入队',
     '替别人绑定邮箱应被拒绝',
+    'public.app_notify_blocked_rows(array[blocked_row])',
+    '领取后撤销身份的行应被投递前复核挡下',
+    '关闭类型后已积压的该类提醒应作废',
+    '打开结果通知后，拒绝申请应提醒申请人本人',
+    '普通成员不应能修改提醒设置',
   ]) assert.ok(verify.includes(needed), `验证脚本缺少：${needed}`);
   assert.equal(/\binsert into public\.notifications\b/.test(verify), false, '队列记录必须由触发器产生，验证不能自己插行');
 });
 test('README 说明密钥、执行顺序与两种消费入口', () => {
-  for (const needed of ['EMAIL_API_URL', 'EMAIL_API_KEY', 'EMAIL_FROM', 'CRON_SECRET', 'app_register_email_cron', 'send_notifications', 'supabase/admin-settings-audit.sql', 'x-app-cron']) assert.ok(readme.includes(needed), `README 缺少：${needed}`);
+  for (const needed of ['EMAIL_API_URL', 'EMAIL_API_KEY', 'EMAIL_FROM', 'CRON_SECRET', 'app_register_email_cron', 'send_notifications', 'supabase/admin-settings-audit.sql', 'x-app-cron', 'NOTIFY_MAX_RUNTIME_MS']) assert.ok(readme.includes(needed), `README 缺少：${needed}`);
 });

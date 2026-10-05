@@ -88,6 +88,11 @@ test('curl 超时必须大于函数一轮的消费预算，否则客户端先断
   assert.ok(seconds(drain, /STABX_NOTIFY_TIMEOUT:-(\d+)/) > budgetSeconds, 'drain.sh 的默认超时必须大于 NOTIFY_MAX_RUNTIME_MS');
   assert.ok(seconds(source('deploy/drain.env.example'), /STABX_NOTIFY_TIMEOUT=(\d+)/) > budgetSeconds, '模板里的超时必须大于 NOTIFY_MAX_RUNTIME_MS');
   assert.match(source('deploy/README.md'), /必须\*\*大于\*\*函数侧一轮消费的预算/);
+  // 托管免费方案的墙钟与 idle timeout 都是 150 秒：默认预算必须留在其内，自托管覆盖也不能超过 curl 超时。
+  assert.ok(NOTIFY_QUEUE.maxRuntimeMs < 150000, '默认预算必须在免费方案 150 秒墙钟之内');
+  const composeBudget = seconds(override, /NOTIFY_MAX_RUNTIME_MS:-(\d+)/);
+  assert.ok(composeBudget > NOTIFY_QUEUE.maxRuntimeMs, '自托管覆盖的预算应当大于托管默认值');
+  assert.ok(seconds(drain, /STABX_NOTIFY_TIMEOUT:-(\d+)/) > composeBudget / 1000, 'drain.sh 的超时必须大于自托管覆盖里的预算');
   // pg_net 的 timeout_milliseconds 目前被忽略，所以定时 SQL 有意不传它，靠函数侧预算收尾。
   const cronSql = source('supabase/migrations/20261005140000_email_notify_cron.sql');
   assert.equal(/timeout_milliseconds\s*:=/.test(cronSql), false, 'pg_net 的超时参数目前无效，不要传');

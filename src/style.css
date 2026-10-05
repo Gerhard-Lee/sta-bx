@@ -21,6 +21,12 @@ fieldset{border:0;padding:0;margin:0;min-width:0}
 .admin-settings label{display:block;font-size:.9375rem;color:#53617a;margin-bottom:16px}
 .admin-settings .check-row{display:flex;margin-bottom:12px}
 .role-choices,.export-actions{display:flex;align-items:center;gap:16px;flex-wrap:wrap}
+.notify-event-groups{display:flex;flex-direction:column;gap:6px;margin:2px 0 10px}
+.notify-event-group{display:flex;align-items:center;gap:16px;flex-wrap:wrap;padding:6px 0;border-top:1px dashed #e9edf4}
+.notify-event-group:first-child{border-top:0}
+.notify-event-title{min-width:170px;color:#53617a;font-size:.875rem;font-weight:650}
+.notify-event-title small{display:block;color:#8b97aa;font-weight:400;font-size:.75rem}
+.notify-event-group .check-row{display:flex;margin:0}
 .audit-table table{min-width:1080px}
 .audit-time{font-variant-numeric:tabular-nums;white-space:nowrap;font-size:.875rem}
 .audit-ip{font-family:ui-monospace,monospace;font-size:.8rem;overflow-wrap:anywhere;max-width:190px}

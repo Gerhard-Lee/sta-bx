@@ -45,9 +45,11 @@ test('带 #小节 的链接指向真实存在的小节（锚点不再失效）',
 test('通知文档的事件清单与代码里的完全一致，并说明哪些状态不发信', () => {
   const text = doc('notifications.md');
   for (const event of NOTIFY_EVENTS) assert.ok(text.includes(event), `通知文档缺少事件：${event}`);
-  assert.equal(NOTIFY_EVENTS.length, 5);
+  assert.equal(NOTIFY_EVENTS.length, 7);
   for (const skipped of ['`rejected`', '`paid`', '不发']) assert.ok(text.includes(skipped.replace(/`/g, '`')), `通知文档没有说明不发信的情况：${skipped}`);
-  for (const key of ['EMAIL_API_URL', 'EMAIL_API_KEY', 'EMAIL_FROM', 'APP_URL', 'CRON_SECRET']) assert.ok(text.includes(key), `通知文档缺少密钥：${key}`);
+  for (const key of ['EMAIL_API_URL', 'EMAIL_API_KEY', 'EMAIL_FROM', 'APP_URL', 'CRON_SECRET', 'NOTIFY_MAX_RUNTIME_MS']) assert.ok(text.includes(key), `通知文档缺少密钥：${key}`);
+  // 七类里哪些默认开、哪些默认关，以及"交给管理员配置"这件事必须在文档里说清。
+  for (const needed of ['settings.email_notify_events', '默认', '管理员']) assert.ok(text.includes(needed), `通知文档缺少配置说明：${needed}`);
 });
 test('权限文档覆盖界面能分配的身份，并点出无法分配的 cashier', () => {
   const text = doc('roles-and-permissions.md');

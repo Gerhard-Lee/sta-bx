@@ -8,6 +8,9 @@ import { readFileSync, readdirSync, existsSync } from 'node:fs';
 import path from 'node:path';
 import { PGlite } from '@electric-sql/pglite';
 import { pgcrypto } from '@electric-sql/pglite/contrib/pgcrypto';
+// 共享加载器给别的真实执行测试（tests/app-api-notify.test.mjs）复用同一套 SQL 栈：
+// 这里断言两边的执行清单逐项一致，避免"执行顺序"这份知识出现第二份可以漂移的副本。
+import { EXECUTION_ORDER as SHARED_EXECUTION_ORDER, fromRoot as sharedFromRoot } from './helpers/sql-stack.mjs';
 
 const ROOT = import.meta.dirname ? path.dirname(import.meta.dirname) : process.cwd();
 const SQL_ROOT = path.join(ROOT, 'supabase');
@@ -174,6 +177,8 @@ test('真实 PostgreSQL 能按文档顺序跑完整套 SQL 栈（4 份散装 SQL
   const names = executed.map((item) => item.file);
   assert.deepEqual(names, EXECUTION_ORDER.map(rel));
   assert.equal(new Set(names).size, names.length, `同一个文件不应执行两次：${names.join('、')}`);
+  // 执行顺序只有一份事实来源：共享 helper（handler 运行时测试用它加载 SQL 栈）必须与这里逐项一致。
+  assert.deepEqual(EXECUTION_ORDER.map(rel), SHARED_EXECUTION_ORDER.map(sharedFromRoot));
 
   const migrationNames = MIGRATION_FILES.map(rel);
   const bulkNames = BULK_FILES.map(rel);

@@ -20,7 +20,7 @@
 | 位置 | 变量 | 说明 |
 | --- | --- | --- |
 | 前端构建环境 | `VITE_SUPABASE_URL`、`VITE_SUPABASE_PUBLISHABLE_KEY` | 只有 publishable key；**绝不放 service role key** |
-| Edge Function 密钥 | `EMAIL_API_URL`、`EMAIL_API_KEY`、`EMAIL_FROM`、`APP_URL`、`CRON_SECRET` | 云端用 Dashboard Secrets 或 `supabase secrets set`；自托管写进 compose override 的 `functions.environment`，值来自 `.env`（`chmod 600`，不进仓库） |
+| Edge Function 密钥 | `EMAIL_API_URL`、`EMAIL_API_KEY`、`EMAIL_FROM`、`APP_URL`、`CRON_SECRET`、可选 `NOTIFY_MAX_RUNTIME_MS` | 云端用 Dashboard Secrets 或 `supabase secrets set`；自托管写进 compose override 的 `functions.environment`，值来自 `.env`（`chmod 600`，不进仓库）。`NOTIFY_MAX_RUNTIME_MS` 是一轮消费预算（毫秒，30 秒–15 分钟）：不设时用 110 秒（托管免费方案 150 秒墙钟之内），自托管覆盖默认给 240 秒 |
 | 中继容器 | `SMTP_HOST/PORT/USER/PASS`、`RELAY_TOKEN` | `SMTP_PASS` 是 QQ 的**授权码**，只存在这一处；`RELAY_TOKEN` 与函数的 `EMAIL_API_KEY` 同值 |
 | 主机 cron | `/etc/stabx-notify.env`：`STABX_URL`、`STABX_APIKEY`、`CRON_SECRET` | `STABX_APIKEY` 就是前端的 publishable key（公开值）；`CRON_SECRET` 与函数侧同值 |
 | 数据库 GUC（可选） | `stabx.email_cron_url` / `_public_key` / `_secret` | 只有选择 pg_cron 调度时才需要；`alter database` 后要**新开连接**再登记 |

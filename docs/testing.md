@@ -5,13 +5,16 @@ npm install
 npm test        # 即 node --test，自动发现 tests/*.test.mjs
 ```
 
-当前 96 项，全部通过；没有 CI（仓库里没有 `.github/workflows`），所以**提交前必须本地跑一次**。其中 `tests/sql-migrations.test.mjs`（6 项，PGlite 真实执行，约 18 秒）是耗时最大的一环。
+当前 104 项，全部通过；没有 CI（仓库里没有 `.github/workflows`），所以**提交前必须本地跑一次**。耗时主要在三条真实执行测试上：`tests/sql-migrations.test.mjs`（6 项，约 18 秒，含 PGlite 整套 SQL 栈）与 `tests/app-api-notify.test.mjs`（5 项，约 9 秒，含同一个栈 + 真实 handler）。
+
+`tests/helpers/` 下的两个模块不是测试文件（`node --test` 不会当用例跑），只给真实执行测试复用：`sql-stack.mjs` 是 SQL 栈加载器（`tests/sql-migrations.test.mjs` 断言它与自己的执行清单逐项一致，保证"执行顺序"只有一份事实来源），`pglite-supabase-adapter.mjs` 是把 PostgREST 调用翻译成 PGlite SQL 的假 Supabase 客户端。
 
 ## 三类测试：能真跑的就真跑
 
 1. **真实执行**——凡是能真实运行的部分，不允许只做字符串断言：
    - `tests/sql-migrations.test.mjs`：用 PGlite（真实 PostgreSQL 18 + pgcrypto 的 WASM 构建）按 [database-migrations.md](database-migrations.md) 的顺序，把 4 份散装 SQL、`migrations/` 下全部迁移与全部 `.verify.sql` **真的执行一遍**，再检查对象、签名与行为。PR #19 评审发现的 `array_agg(a.attname)` 解析错误（`operator does not exist: name[] = text[]`）只有真执行才抓得到。
    - `tests/mail-relay.test.mjs`：真实 nodemailer（自定义 transport 只替换 SMTP 那一层）+ 真实 HTTP server/handler，覆盖"投递结果回来之前不能回 200"、失败回 502、鉴权/发件地址/限频与 `Retry-After`。评审发现的 `sendMail(message, { maxAttempts: 1 })`（第二个参数其实是回调，`await` 拿到 `undefined`）由它复现并永久锁住。
+   - `tests/app-api-notify.test.mjs`：把 `supabase/functions/app-api/index.ts` 真的跑起来（esbuild 转译 + 假 Supabase 客户端接在 PGlite 上 + 假邮件 fetch），驱动真实 `drainNotifications`。覆盖"领取之后、投递之前被撤角色/关类型 → `sent: 0` 且行 `cancelled`"（复审的 P1）与"预算可由 `NOTIFY_MAX_RUNTIME_MS` 覆盖并写审计"。
    - 纯逻辑（`validateEmail`、`validateFile`、`validateStep`、`hasRole`、`isSuperAdmin`、金额与日期格式化）直接调用 `src/*-rules.js` 的真模块断言——这也是把规则从组件里抽出来的理由。
 2. **契约断言**——真实执行代价过高的"多处必须同时成立"，写对源码的断言：事件清单（前端数组 / app-api 文案表 / 数据库 `check` 约束三处逐项相等）、队列参数（前端常量 ↔ app-api 字面量 ↔ 数据库取值范围）、权限判定入口、密钥来源。它们不验证运行时行为，但能挡住最容易出的错：**改了其中一处、忘了另外两处**。
 3. **安全负向断言**——某些东西不许出现。
@@ -42,6 +45,7 @@ assert.equal(/^\s+ports:/m.test(relayBlock), false);                            
 | `tests/email-notify.test.mjs` | 通知全链路契约：事件、收件人、去重与作废、身份/版本/状态三重复核、租约领取与失败上限、时间预算、限频、定时入口、隐私边界 |
 | `tests/sql-migrations.test.mjs` | **真实执行**：PGlite 里按顺序跑散装 SQL、全部迁移与全部 `.verify.sql`（6 项，约 18 秒），并校验对象、五参数签名、旧写法的必然失败与"verify 不留数据" |
 | `tests/mail-relay.test.mjs` | **真实执行**：真实 nodemailer + 真实 HTTP handler 的成功/失败/鉴权/限频四条路径 |
+| `tests/app-api-notify.test.mjs` | **真实执行**：真实 app-api handler + PGlite SQL adapter，覆盖领取后撤角色/关类型不投递、预算环境变量与审计 |
 | `tests/docs.test.mjs` | 文档集完整、相对链接与锚点有效、迁移清单与事件清单与代码一致 |
 | `tests/self-host-deploy.test.mjs` | 部署层：中继接口形状与不泄露、compose 不发布端口、脚本无硬编码密钥、LF 约束 |
 | `tests/workflow-preview.{jsx,html}` | 手工预览夹具，不参与 `npm test` |
