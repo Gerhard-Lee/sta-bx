@@ -5,9 +5,11 @@ npm install
 npm test        # 即 node --test，自动发现 tests/*.test.mjs
 ```
 
-当前 104 项，全部通过；没有 CI（仓库里没有 `.github/workflows`），所以**提交前必须本地跑一次**。耗时主要在三条真实执行测试上：`tests/sql-migrations.test.mjs`（6 项，约 18 秒，含 PGlite 整套 SQL 栈）与 `tests/app-api-notify.test.mjs`（5 项，约 9 秒，含同一个栈 + 真实 handler）。
+当前 106 项，全部通过；没有 CI（仓库里没有 `.github/workflows`），所以**提交前必须本地跑一次**。耗时主要在三条真实执行测试上：`tests/sql-migrations.test.mjs`（6 项，约 18 秒，含 PGlite 整套 SQL 栈）与 `tests/app-api-notify.test.mjs`（6 项，约 9 秒，含同一个栈 + 真实 handler）。
 
-`tests/helpers/` 下的两个模块不是测试文件（`node --test` 不会当用例跑），只给真实执行测试复用：`sql-stack.mjs` 是 SQL 栈加载器（`tests/sql-migrations.test.mjs` 断言它与自己的执行清单逐项一致，保证"执行顺序"只有一份事实来源），`pglite-supabase-adapter.mjs` 是把 PostgREST 调用翻译成 PGlite SQL 的假 Supabase 客户端。
+`tests/helpers/` 下的两个模块不是测试文件（`node --test` 不会当用例跑），只给真实执行测试复用：`sql-stack.mjs` 是 SQL 栈加载器（`tests/sql-migrations.test.mjs` 断言它与自己的执行清单逐项一致，保证"执行顺序"只有一份事实来源；它还建了一个 **cron 桩**——`cron.job` + `cron.schedule/unschedule`——让没有真实 pg_cron 的环境也能验证登记 SQL），`pglite-supabase-adapter.mjs` 是把 PostgREST 调用翻译成 PGlite SQL 的假 Supabase 客户端（`.single()`/`.maybeSingle()` 与 `count` 语义对齐真实 supabase-js）。
+
+**变异测试是这一轮的验收方式**：把实现改坏一处（去掉身份检查、事件映射错位、漏掉 `status='sending'` 过滤、丢弃不计数、把总开关当关类型），`tests/sql-migrations.test.mjs` 必须失败。五个变异全部被抓到；反过来，同一批变异在修补前的 verify 上有四个能溜过去——所以新增断言时优先问"删掉实现这行会不会失败"。
 
 ## 三类测试：能真跑的就真跑
 
@@ -45,7 +47,7 @@ assert.equal(/^\s+ports:/m.test(relayBlock), false);                            
 | `tests/email-notify.test.mjs` | 通知全链路契约：事件、收件人、去重与作废、身份/版本/状态三重复核、租约领取与失败上限、时间预算、限频、定时入口、隐私边界 |
 | `tests/sql-migrations.test.mjs` | **真实执行**：PGlite 里按顺序跑散装 SQL、全部迁移与全部 `.verify.sql`（6 项，约 18 秒），并校验对象、五参数签名、旧写法的必然失败与"verify 不留数据" |
 | `tests/mail-relay.test.mjs` | **真实执行**：真实 nodemailer + 真实 HTTP handler 的成功/失败/鉴权/限频四条路径 |
-| `tests/app-api-notify.test.mjs` | **真实执行**：真实 app-api handler + PGlite SQL adapter，覆盖领取后撤角色/关类型不投递、预算环境变量与审计 |
+| `tests/app-api-notify.test.mjs` | **真实执行**：真实 app-api handler + PGlite SQL adapter，覆盖领取后撤角色/关类型不投递、复核接口失败时退回而不烧队列、预算环境变量与审计、结果通知开关 |
 | `tests/docs.test.mjs` | 文档集完整、相对链接与锚点有效、迁移清单与事件清单与代码一致 |
 | `tests/self-host-deploy.test.mjs` | 部署层：中继接口形状与不泄露、compose 不发布端口、脚本无硬编码密钥、LF 约束 |
 | `tests/workflow-preview.{jsx,html}` | 手工预览夹具，不参与 `npm test` |

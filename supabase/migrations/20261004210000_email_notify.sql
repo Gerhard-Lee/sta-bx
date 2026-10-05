@@ -34,6 +34,23 @@ alter table public.settings add column if not exists email_notify_enabled boolea
 -- 默认只开"需要有人动手"的五类待办；拒绝申请、已付款是结果通知，默认关，管理员需要时在设置里打开。
 -- 白名单与 notifications.event 的 check 约束保持一致（两边同时改）。
 alter table public.settings add column if not exists email_notify_events text[] not null default array['待财委审批','待主席审批','退回修改','待补充收款码','待付款登记'];
+-- 更早的中间版本可能留下过同名列（没有默认值、可为空）：显式补默认值与非空，
+-- 否则触发器的 `target_event = any(email_notify_events)` 会得到 NULL、静默一封都不发。
+alter table public.settings alter column email_notify_events set default array['待财委审批','待主席审批','退回修改','待补充收款码','待付款登记'];
+update public.settings set email_notify_events = array['待财委审批','待主席审批','退回修改','待补充收款码','待付款登记'] where email_notify_events is null;
+alter table public.settings alter column email_notify_events set not null;
+-- 老库里若已有七类之外的值，直接加约束只会报一句 "violated by some row"；先给出可操作的报错（列出具体取值），
+-- 不静默改配置。历史行处理完再重跑本迁移即可。
+do $$
+declare offenders text;
+begin
+  select string_agg(distinct item, '、') into offenders
+  from public.settings s, unnest(s.email_notify_events) item
+  where item not in ('待财委审批','待主席审批','退回修改','待补充收款码','待付款登记','拒绝申请','已付款');
+  if offenders is not null then
+    raise exception 'settings.email_notify_events 里有不在支持列表中的类型（%）：请先在设置里改成合法类型再重跑本迁移', offenders;
+  end if;
+end $$;
 alter table public.settings drop constraint if exists settings_email_notify_events_check;
 alter table public.settings add constraint settings_email_notify_events_check
   check (email_notify_events is not null
@@ -62,7 +79,18 @@ alter table public.notifications add constraint notifications_attempts_check che
 alter table public.notifications add column if not exists lease_expires_at timestamptz not null default now();
 alter table public.notifications add column if not exists claim_id uuid;
 -- 事件集合是七类：五类"需要有人动手"的待办 + 拒绝申请/已付款两个结果通知（默认关）。
--- 对已执行过旧版（七类或五类）的库同样收敛到这一份名单。
+-- 对已执行过旧版（七类或五类）的库同样收敛到这一份名单；历史行里若有七类之外的事件名，
+-- 先给出可操作的报错（列出具体取值），而不是让约束抛一句难懂的 "violated by some row"。
+do $$
+declare offenders text;
+begin
+  select string_agg(distinct event, '、') into offenders
+  from public.notifications
+  where event not in ('待财委审批','待主席审批','退回修改','待补充收款码','待付款登记','拒绝申请','已付款');
+  if offenders is not null then
+    raise exception 'notifications.event 里有不在支持列表中的值（%）：请先处理这些历史行（例如改成 cancelled 并留档）再重跑本迁移', offenders;
+  end if;
+end $$;
 alter table public.notifications drop constraint if exists notifications_event_check;
 alter table public.notifications add constraint notifications_event_check check (event in ('待财委审批','待主席审批','退回修改','待补充收款码','待付款登记','拒绝申请','已付款'));
 
@@ -189,7 +217,7 @@ begin
 end $$;
 create or replace function public.app_claim_notifications(p_claim_id uuid, p_limit integer, p_lease_seconds integer, p_max_age_hours integer, p_max_attempts integer default 5)
 returns jsonb language plpgsql security definer set search_path = public, private, pg_temp as $$
-declare claimed jsonb; discarded integer; cancelled integer; revoked integer; disabled integer; taken integer;
+declare claimed jsonb; discarded integer; aged integer; cancelled integer; revoked integer; disabled integer; taken integer;
 begin
   if p_claim_id is null then raise exception '缺少领取批次号'; end if;
   if p_limit is null or p_limit < 1 or p_limit > 200 then raise exception '领取数量无效'; end if;
@@ -203,18 +231,23 @@ begin
    where status = 'pending' and created_at < now() - make_interval(hours => p_max_age_hours);
   get diagnostics discarded = row_count;
 
-  -- 上次进程被中断（函数超时或被杀）留下的 sending 行：超龄的与已经用满尝试次数的直接判失败，
-  -- 其余计入一次尝试后退回队列。恢复路径与普通投递失败共用同一个上限，反复中断不会无限重领；
-  -- 超龄行在这里就丢弃，不会因为"先恢复成 pending"而绕过本轮的超龄清理。
+  -- 上次进程被中断（函数超时或被杀）留下的 sending 行，按三种去向处理：
+  --   1) 已超龄：直接判丢弃，并计入 discarded（与第 1 步的超龄 pending 同一个统计口径，审计不会少报）；
+  --   2) 已经用满尝试次数：判永久失败（与普通投递失败走同一个上限与文案）；
+  --   3) 其余：计入一次尝试后退回队列。
   update public.notifications
      set status = 'failed', attempts = attempts + 1, claim_id = null, lease_expires_at = now(),
-         last_error = left(case
-           when created_at < now() - make_interval(hours => p_max_age_hours)
-             then '超过 ' || p_max_age_hours || ' 小时未发送，已丢弃'
-           else '连续 ' || (attempts + 1) || ' 次发送未完成，已停止重试'
-         end, 300)
+         last_error = left('超过 ' || p_max_age_hours || ' 小时未发送，已丢弃', 300)
    where status = 'sending' and lease_expires_at <= now()
-     and (created_at < now() - make_interval(hours => p_max_age_hours) or attempts + 1 >= p_max_attempts);
+     and created_at < now() - make_interval(hours => p_max_age_hours);
+  get diagnostics aged = row_count;
+  discarded := discarded + aged;
+
+  update public.notifications
+     set status = 'failed', attempts = attempts + 1, claim_id = null, lease_expires_at = now(),
+         last_error = left('连续 ' || (attempts + 1) || ' 次发送未完成，已停止重试', 300)
+   where status = 'sending' and lease_expires_at <= now()
+     and attempts + 1 >= p_max_attempts;
 
   update public.notifications
      set status = 'pending', attempts = attempts + 1, claim_id = null, next_attempt_at = now(),
@@ -280,13 +313,15 @@ end $$;
 -- 投递前最后一次复核：app-api 在每个发送组之前调用，只返回"不该再发"的行与原因（没有出现在结果里的就可以发）。
 -- 领取之后到真正投递之间还隔着几秒到几十秒（一轮 100 封、每组 5 封），管理员撤角色或关类型就发生在这个窗口里；
 -- 判定继续复用 private.app_notify_recipient_allowed 与 settings.email_notify_events，不在客户端重写规则。
+-- 只看"逐类开关"，不看总开关：总开关是暂停（本轮已领取的行按组发完、下一轮直接返回 skipped），
+-- 不是"作废"——把它混进来的话，关掉总开关会给出"已关闭「X」提醒"这种与实际不符的作废原因。
 create or replace function public.app_notify_blocked_rows(p_ids bigint[])
 returns jsonb language sql stable security definer set search_path = public, private, pg_temp as $$
   select coalesce(jsonb_agg(jsonb_build_object('id', n.id, 'reason', blocked.reason) order by n.id), '[]'::jsonb)
   from public.notifications n
   cross join lateral (
     select case
-      when not exists(select 1 from public.settings s where s.id = 1 and s.email_notify_enabled and n.event = any(s.email_notify_events))
+      when not exists(select 1 from public.settings s where s.id = 1 and n.event = any(s.email_notify_events))
         then '管理员已关闭「' || n.event || '」提醒，本封已作废'
       when not private.app_notify_recipient_allowed(n.recipient_user_id, n.event)
         then '收件人已不具备该待办的处理身份，提醒已作废'
@@ -379,10 +414,22 @@ begin
       '提醒类型', jsonb_build_object('原值', to_jsonb(old_events), '新值', to_jsonb(normalized))));
 end $$;
 
--- 管理员建号时可选代填邮箱；旧签名先删除，避免与带邮箱的新签名产生歧义。
+-- 管理员建号时可选代填邮箱；旧签名按函数名整体删除（与 app_bind_email / app_claim_notifications /
+-- app_update_email_notify 一致）：只删某个写死的参数列表的话，将来出现别的参数个数时库里会同时留两个候选，
+-- PostgREST 的命名参数调用会报 PGRST203（could not choose the best candidate function）。
 -- p_email 保留默认值是为了让 supabase/admin-settings-audit.verify.sql 的六参数写法继续可跑；
 -- app-api 通过 PostgREST 以命名参数调用，始终带上 p_email，因此不会被旧重载抢走。
-drop function if exists public.app_admin_create_user(uuid, text, text, text, text, text[]);
+do $$
+declare item record;
+begin
+  for item in
+    select p.oid, p.proname from pg_proc p
+    join pg_namespace n on n.oid = p.pronamespace
+    where n.nspname = 'public' and p.proname = 'app_admin_create_user'
+  loop
+    execute format('drop function public.%I(%s)', item.proname, pg_get_function_identity_arguments(item.oid));
+  end loop;
+end $$;
 create or replace function public.app_admin_create_user(p_actor_id uuid, p_username text, p_password text, p_full_name text, p_department text, p_roles text[], p_email text default '')
 returns jsonb language plpgsql security definer set search_path = public, private, pg_temp as $$
 declare u jsonb; normalized text := lower(trim(coalesce(p_email, '')));

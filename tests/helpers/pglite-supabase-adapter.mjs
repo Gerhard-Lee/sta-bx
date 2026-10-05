@@ -28,6 +28,7 @@ class QueryBuilder {
     this.singleMode = null;
     this.columns = null;
     this.head = false;
+    this.countMode = null;
     this.rows = null;
     this.fields = null;
   }
@@ -35,6 +36,8 @@ class QueryBuilder {
   select(columns = '*', options = {}) {
     this.columns = columns;
     this.head = options.head === true;
+    // 真实 supabase-js 只在显式传 count:'exact' 时才返回 count；没有它时 count 是 null。
+    this.countMode = options.count ?? null;
     return this;
   }
   insert(rows) { this.verb = 'insert'; this.rows = Array.isArray(rows) ? rows : [rows]; return this; }
@@ -99,7 +102,15 @@ class QueryBuilder {
     if (this.rowLimit !== null) sql += ` limit ${Number(this.rowLimit)}`;
     if (this.offset !== null) sql += ` offset ${Number(this.offset)}`;
     const result = await this.query(sql);
-    if (this.head) return { data: null, error: null, count: Number(result.rows[0]?.count ?? 0) };
+    if (this.head) return { data: null, error: null, count: this.countMode ? Number(result.rows[0]?.count ?? 0) : null };
+    // 与真实 supabase-js 对齐：`.single()` 要求恰好一行（0 行或多行都报错），
+    // `.maybeSingle()` 允 0 行、多行报错。不能让"本该报错的查询"在这里静默拿到第一行。
+    if (this.singleMode === 'single' && result.rows.length !== 1) {
+      return { data: null, error: { message: 'JSON object requested, multiple (or no) rows returned' }, count: null };
+    }
+    if (this.singleMode === 'maybe' && result.rows.length > 1) {
+      return { data: null, error: { message: 'JSON object requested, multiple (or no) rows returned' }, count: null };
+    }
     return { data: this.singleMode ? (result.rows[0] ?? null) : result.rows, error: null, count: null };
   }
 
@@ -118,7 +129,11 @@ class QueryBuilder {
     const entries = Object.entries(this.fields);
     let sql = `update public.${this.table} set ${entries.map(([key, value]) => `${key} = $${this.param(value)}`).join(', ')}`;
     sql += this.whereSql();
+    // 链了 .select(...) 就等于 supabase-js 的 `Prefer: return=representation`：返回被改动的行。
+    // 生产代码用返回的行数判断"到底改到没有"（0 行说明这一行已被别的批次抢走）。
+    if (this.columns) sql += ` returning ${selectList(this.columns)}`;
     const result = await this.query(sql);
+    if (this.columns) return { data: this.singleMode ? (result.rows[0] ?? null) : result.rows, error: null, count: result.affectedRows ?? 0 };
     return { data: null, error: null, count: result.affectedRows ?? 0 };
   }
 

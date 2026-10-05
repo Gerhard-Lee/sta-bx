@@ -11,7 +11,7 @@ services:
       EMAIL_FROM: ${EMAIL_FROM}
       APP_URL: ${APP_URL}
       CRON_SECRET: ${CRON_SECRET}
-      # 自托管可以把一轮消费预算调大（毫秒，30 秒–15 分钟；不设时用代码里的默认 110 秒，
+      # 自托管可以把一轮消费预算调大（毫秒，55 秒–15 分钟；不设时用代码里的默认 110 秒，
       # 那是为托管免费方案 150 秒墙钟留的余量）。必须小于 cron 侧的 STABX_NOTIFY_TIMEOUT。
       NOTIFY_MAX_RUNTIME_MS: ${NOTIFY_MAX_RUNTIME_MS:-240000}
       # 自托管必须设置：签名文件地址要换成浏览器可达的公网地址（否则返回 http://api-gw:8000/…）。

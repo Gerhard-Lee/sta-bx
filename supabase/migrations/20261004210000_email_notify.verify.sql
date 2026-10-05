@@ -11,6 +11,8 @@ declare
   super_id uuid;
   owner_id uuid;
   finance_id uuid;
+  chair_id uuid;
+  plain_id uuid;
   nomail_id uuid;
   offline_id uuid;
   app_id uuid;
@@ -21,6 +23,7 @@ declare
   events_now text[];
   blocked_row bigint;
   allowed_row bigint;
+  claim_1_ids bigint[];
   round_index integer;
   claim_1 uuid;
   claim_2 uuid;
@@ -68,10 +71,16 @@ begin
 
   owner_id := (private.app_insert_user('verify_owner_' || substr(gen_random_uuid()::text, 1, 8), 'Test-only-1369666', '验证申请人', '验证组')->>'id')::uuid;
   finance_id := (private.app_insert_user('verify_finance_' || substr(gen_random_uuid()::text, 1, 8), 'Test-only-1369666', '验证财委', '验证组')->>'id')::uuid;
+  chair_id := (private.app_insert_user('verify_chair_' || substr(gen_random_uuid()::text, 1, 8), 'Test-only-1369666', '验证主席', '验证组')->>'id')::uuid;
+  -- 反向夹具：账号启用、邮箱已绑、但没有任何身份。所有"按身份发信"的事件都必须跳过它
+  -- （审查用变异验证过：没有这个成员时，把中文的财务/付款身份检查删掉，旧断言照样全绿）。
+  plain_id := (private.app_insert_user('verify_plain_' || substr(gen_random_uuid()::text, 1, 8), 'Test-only-1369666', '验证无身份', '验证组')->>'id')::uuid;
   nomail_id := (private.app_insert_user('verify_nomail_' || substr(gen_random_uuid()::text, 1, 8), 'Test-only-1369666', '验证未绑定', '验证组')->>'id')::uuid;
   offline_id := (private.app_insert_user('verify_offline_' || substr(gen_random_uuid()::text, 1, 8), 'Test-only-1369666', '验证已停用', '验证组')->>'id')::uuid;
   perform public.app_bind_email(owner_id, owner_id, 'verify-owner@example.com');
   perform public.app_bind_email(finance_id, finance_id, 'verify-finance@example.com');
+  perform public.app_bind_email(chair_id, chair_id, 'verify-chair@example.com');
+  perform public.app_bind_email(plain_id, plain_id, 'verify-plain@example.com');
   perform public.app_bind_email(offline_id, offline_id, 'verify-offline@example.com');
   -- 数据库层不允许替别人绑定邮箱（app-api 只会传当前登录账号）。
   begin
@@ -81,9 +90,13 @@ begin
     if sqlerrm not like '%只能绑定自己的邮箱%' then raise; end if;
   end;
   perform public.app_set_member_roles(super_id, finance_id, array['finance'], true);
+  perform public.app_set_member_roles(super_id, chair_id, array['chair'], true);
+  perform public.app_set_member_roles(super_id, plain_id, array[]::text[], true);
   perform public.app_set_member_roles(super_id, nomail_id, array['finance'], true);
   perform public.app_set_member_roles(super_id, offline_id, array['finance'], true);
   update public.app_users set active = false where id = offline_id;
+  -- 内置 admin 也绑邮箱：superadmin 通过 finance/chair/cashier 判定，所以它会是审批类与付款类提醒的收件人之一。
+  perform public.app_bind_email(super_id, super_id, 'verify-admin@example.com');
 
   insert into public.applications(owner_id, title, purpose, amount, category, department, use_date, status, version)
   values (owner_id, '验证邮件通知', '仅用于迁移验证', 12.00, '物资', '验证组', current_date, 'draft', 0)
@@ -97,8 +110,27 @@ begin
   update public.applications set status = 'draft', version = 1 where id = app_id;
   update public.applications set status = 'finance_pending', version = 1 where id = app_id;
 
-  if not exists(select 1 from public.notifications where application_id = app_id and event = '待财委审批' and recipient_user_id = finance_id) then raise exception '已绑定邮箱的财委应收到待审批提醒'; end if;
-  if exists(select 1 from public.notifications where application_id = app_id and recipient_user_id in (owner_id, nomail_id, offline_id)) then raise exception '申请人本人、未绑定邮箱和已停用的成员都不应入队'; end if;
+  -- 收件人一律用**显式集合**断言，不能用与实现同一个谓词推导：
+  -- 那样"删掉中文的 finance/cashier 检查"这类改动会静默通过（审查用变异验证过）。
+  expected := array[finance_id, super_id];
+  select coalesce(array_agg(recipient_user_id), '{}'::uuid[]) into actual
+  from public.notifications where application_id = app_id and application_version = 1 and event = '待财委审批';
+  if not (actual <@ expected and actual @> expected) then
+    raise exception '待财委审批的收件人应恰好是财委与内置 admin，实际 %', actual;
+  end if;
+
+  -- 主席审批：只发主席与内置 admin（superadmin 通过 chair 判定），事件名必须是「待主席审批」。
+  update public.applications set status = 'draft', version = 3 where id = app_id;
+  update public.applications set status = 'chair_pending', version = 3 where id = app_id;
+  expected := array[chair_id, super_id];
+  select coalesce(array_agg(recipient_user_id), '{}'::uuid[]) into actual
+  from public.notifications where application_id = app_id and application_version = 3 and event = '待主席审批';
+  if not (actual <@ expected and actual @> expected) then
+    raise exception '待主席审批的收件人应恰好是主席与内置 admin，实际 %', actual;
+  end if;
+  if exists(select 1 from public.notifications where application_id = app_id and application_version = 3 and event = '待财委审批') then
+    raise exception 'chair_pending 不应生成待财委审批（事件映射错位）';
+  end if;
 
   -- 同一版本同一事件重复进入同一状态：去重，只留一封。
   update public.applications set status = 'draft', version = 1 where id = app_id;
@@ -112,24 +144,23 @@ begin
   select count(*) into queued from public.notifications where application_id = app_id and event = '待财委审批' and recipient_user_id = finance_id;
   if queued <> 2 then raise exception '新版本应重新入队，实际 %', queued; end if;
 
-  -- 申请人自己要动手的两类：只发给申请人本人，不打扰审批人。
+  -- 申请人自己要动手的两类：只发给申请人本人，不打扰审批人或无身份成员。
   update public.applications set status = 'changes_requested' where id = app_id;
-  if not exists(select 1 from public.notifications where application_id = app_id and event = '退回修改' and recipient_user_id = owner_id) then raise exception '退回修改应提醒申请人本人'; end if;
-  if exists(select 1 from public.notifications where application_id = app_id and event = '退回修改' and recipient_user_id = finance_id) then raise exception '退回修改不应发给审批人'; end if;
+  expected := array[owner_id];
+  select coalesce(array_agg(recipient_user_id), '{}'::uuid[]) into actual
+  from public.notifications where application_id = app_id and event = '退回修改';
+  if not (actual <@ expected and actual @> expected) then raise exception '退回修改只应发给申请人本人，实际 %', actual; end if;
   update public.applications set status = 'payment_info_required' where id = app_id;
-  if not exists(select 1 from public.notifications where application_id = app_id and event = '待补充收款码' and recipient_user_id = owner_id) then raise exception '待补充收款码应提醒申请人本人'; end if;
+  expected := array[owner_id];
+  select coalesce(array_agg(recipient_user_id), '{}'::uuid[]) into actual
+  from public.notifications where application_id = app_id and event = '待补充收款码';
+  if not (actual <@ expected and actual @> expected) then raise exception '待补充收款码只应发给申请人本人，实际 %', actual; end if;
 
   -- 收款码被移除（payment_pending → payment_info_required）会把本轮的“待付款登记”提醒作废，
   -- 重新提交收款码后必须能再次提醒付款登记人（同一版本内允许第二次）。
-  -- 合格收件人要用与实现同一处的判定函数推导，不能写死“恰好一封”：main 已合入“付款登记视同财委”，
-  -- 内置 admin（superadmin 判定）与已绑邮箱的财委都能通过 cashier 判定，各应收到一封。
-  perform public.app_bind_email(super_id, super_id, 'verify-admin@example.com');
-  select coalesce(array_agg(u.id order by u.id), '{}'::uuid[]) into expected
-  from public.app_users u
-  where u.active and coalesce(u.email, '') <> '' and u.id <> owner_id
-    and private.app_user_has_role(u.id, 'cashier');
-  if not (super_id = any(expected)) then raise exception '前置条件失败：内置 admin 应通过付款登记身份判定'; end if;
-  if not (finance_id = any(expected)) then raise exception '付款登记视同财委：已绑邮箱的财委也应是合格收件人'; end if;
+  -- 合格收件人用显式集合断言（不能用与实现同一个谓词推导）：付款登记视同财委 → 内置 admin 与财委各一封；
+  -- 主席、无身份成员、未绑邮箱、已停用都不收。
+  expected := array[finance_id, super_id];
 
   update public.applications set status = 'payment_pending' where id = app_id;
   if not exists(select 1 from public.notifications where application_id = app_id and event = '待付款登记' and recipient_user_id = super_id and status = 'pending') then
@@ -140,11 +171,11 @@ begin
     raise exception '移除收款码应作废本轮的待付款登记提醒';
   end if;
   update public.applications set status = 'payment_pending' where id = app_id;
-  select coalesce(array_agg(recipient_user_id order by recipient_user_id), '{}'::uuid[]) into actual
+  select coalesce(array_agg(recipient_user_id), '{}'::uuid[]) into actual
   from public.notifications
   where application_id = app_id and event = '待付款登记' and status <> 'cancelled';
-  if actual is distinct from expected then
-    raise exception '重新提交收款码后应再次入队：每个合格收件人各一封（期望 %，实际 %）', expected, actual;
+  if not (actual <@ expected and actual @> expected) then
+    raise exception '重新提交收款码后应再次入队：收件人应恰好是内置 admin 与财委（期望 %，实际 %）', expected, actual;
   end if;
 
   -- 消费前复核收件人身份（审查发现 P1-3）：撤销财委角色、账号仍启用时，指向他的待发提醒必须在领取时作废，
@@ -194,17 +225,24 @@ begin
   -- 只比较本次验证产生的行：库里可能存在其它待发行，它们同样会被领取。
   select count(*) into dup from public.notifications where claim_id = claim_1 and application_id = app_id;
   if dup <> queued then raise exception '本轮应领取本次验证产生的 % 封，实际 %', queued, dup; end if;
+  -- 记下第一批的 id 集合，供"第二批不得重复领取"使用（见下）。
+  select coalesce(array_agg((element->>'id')::bigint), '{}'::bigint[]) into claim_1_ids
+  from jsonb_array_elements(result->'rows') element;
   if exists(select 1 from public.notifications where claim_id = claim_1 and status <> 'sending') then raise exception '已领取的行必须处于发送中'; end if;
   if exists(select 1 from public.notifications where claim_id = claim_1 and lease_expires_at <= now()) then raise exception '领取必须带上未过期的租约'; end if;
   if exists(select 1 from public.notifications where application_id = app_id and status = 'pending' and next_attempt_at <= now()) then raise exception '到期的待发行应被本轮领走'; end if;
 
   -- 第二个批次不得重复拿到同一个 id（租约内不可见）。
+  -- 断言方式：直接比较两批返回的 id 集合。原先写的是 `claim_id = claim_1 and id in (第二批返回的 id)`，
+  -- 第二批返回的行按定义属于 claim_2，两个 uuid 不可能相等——那条断言恒真，挡不住"第二批偷走同一行"。
   claim_2 := gen_random_uuid();
   result := public.app_claim_notifications(claim_2, 200, 300, 24, 5);
-  select count(*) into dup from public.notifications where claim_id = claim_1 and id in (
-    select (element->>'id')::bigint from jsonb_array_elements(result->'rows') element
-  );
-  if dup <> 0 then raise exception '同一封邮件不应被两个批次领取'; end if;
+  select count(*) into dup from (
+    select (element->>'id')::bigint as id from jsonb_array_elements(result->'rows') element
+    intersect
+    select unnest(claim_1_ids)
+  ) overlap;
+  if dup <> 0 then raise exception '同一封邮件不应被两个批次领取，实际重复 % 封', dup; end if;
 
   -- 上一轮中断（租约过期）：重新排队并计入一次尝试。
   update public.notifications set lease_expires_at = now() - interval '1 minute' where claim_id = claim_1;
@@ -218,6 +256,7 @@ begin
   result := public.app_claim_notifications(gen_random_uuid(), 200, 300, 24, 5);
   if exists(select 1 from public.notifications where application_id = app_id and status in ('pending','sending')) then raise exception '超龄提醒不应继续留在队列'; end if;
   if not exists(select 1 from public.notifications where application_id = app_id and status = 'failed' and last_error like '%已丢弃') then raise exception '丢弃应保留原因'; end if;
+  if coalesce((result->>'discarded')::integer, 0) < 1 then raise exception '丢弃数应计入返回结果，实际 %', result->>'discarded'; end if;
 
   -- 中断恢复同样执行失败上限（审查发现 P2-5）：反复“领取 → 租约过期”不能无限重领。
   -- 旧版恢复路径只加 attempts 而领取时不再看上限，七轮之后仍停在 sending/attempts=6。
@@ -245,13 +284,17 @@ begin
   select count(*) into queued from public.notifications where application_id = app_id and status = 'failed' and last_error like '%小时未发送，已丢弃%';
   update public.notifications set created_at = now() - interval '30 days', lease_expires_at = now() - interval '1 minute'
     where application_id = app_id and status = 'sending';
-  perform public.app_claim_notifications(gen_random_uuid(), 200, 300, 24, 5);
+  result := public.app_claim_notifications(gen_random_uuid(), 200, 300, 24, 5);
   if exists(select 1 from public.notifications where application_id = app_id and status in ('pending','sending')) then
     raise exception '超龄的发送中行恢复后不应继续留在队列：%', (select string_agg(id || ':' || event || ':v' || application_version || ':' || status || ':' || attempts, ', ')
       from public.notifications where application_id = app_id and status in ('pending','sending'));
   end if;
   if (select count(*) from public.notifications where application_id = app_id and status = 'failed' and last_error like '%小时未发送，已丢弃%') <= queued then
     raise exception '超龄的发送中行恢复时应记为已丢弃';
+  end if;
+  -- 恢复分支丢弃的超龄 sending 行也要计入返回结果的 discarded（否则审计里"丢弃 N 封"会少报）。
+  if coalesce((result->>'discarded')::integer, 0) < 1 then
+    raise exception '超龄 sending 行恢复丢弃时应计入 discarded，实际 %', result->>'discarded';
   end if;
 
   -- 永久失败可以重新排队；但只有管理员可以。
@@ -303,8 +346,15 @@ begin
     raise exception '拒绝申请只应发给申请人本人';
   end if;
   update public.applications set status = 'paid', version = 7 where id = app_id;
-  if not exists(select 1 from public.notifications where application_id = app_id and event = '已付款' and recipient_user_id = owner_id) then
-    raise exception '打开结果通知后，已付款应提醒申请人本人';
+  expected := array[owner_id];
+  select coalesce(array_agg(recipient_user_id), '{}'::uuid[]) into actual
+  from public.notifications where application_id = app_id and event = '已付款';
+  if not (actual <@ expected and actual @> expected) then
+    raise exception '已付款只应发给申请人本人，实际 %', actual;
+  end if;
+  -- 结果类也不能发给"启用+有邮箱但没有身份"的成员（负向夹具）。
+  if exists(select 1 from public.notifications where application_id = app_id and recipient_user_id = plain_id) then
+    raise exception '无身份成员不应收到任何提醒';
   end if;
 
   begin
@@ -358,6 +408,26 @@ begin
   if exists(select 1 from jsonb_array_elements(public.app_notify_blocked_rows(array[allowed_row])) e
             where (e->>'id')::bigint = allowed_row) then
     raise exception '身份仍有效的行不应被投递前复核挡下';
+  end if;
+  -- 总开关只暂停、不作废：关掉总开关时，投递前复核不能把仍然勾选的类型判成"已关闭"（下一轮直接 skipped）。
+  perform public.app_update_email_notify(super_id, false, array['待财委审批','待主席审批','退回修改','待补充收款码','待付款登记','拒绝申请','已付款']);
+  if exists(select 1 from jsonb_array_elements(public.app_notify_blocked_rows(array[allowed_row])) e
+            where (e->>'id')::bigint = allowed_row) then
+    raise exception '总开关关闭只应暂停，不应被投递前复核当成作废';
+  end if;
+  -- 反过来，逐类开关关掉后，正在发送的那一行必须在投递前被挡下。
+  perform public.app_update_email_notify(super_id, true, array['待主席审批','退回修改','待补充收款码','待付款登记','拒绝申请','已付款']);
+  if not exists(select 1 from jsonb_array_elements(public.app_notify_blocked_rows(array[allowed_row])) e
+                where (e->>'id')::bigint = allowed_row and e->>'reason' like '%已关闭%') then
+    raise exception '关掉某一类后，投递前复核应把该类正在发送的行挡下';
+  end if;
+  -- 复核只认"正在发送"的行：把该类关掉 + 这一行改成 failed，复核仍必须忽略它
+  -- （只测"身份有效的 failed 行"是抓不到漏掉 status 过滤的：那种行本来也不会被返回）。
+  perform public.app_update_email_notify(super_id, true, array['待主席审批','退回修改','待补充收款码','待付款登记','拒绝申请','已付款']);
+  update public.notifications set status = 'failed' where id = allowed_row;
+  if exists(select 1 from jsonb_array_elements(public.app_notify_blocked_rows(array[allowed_row])) e
+            where (e->>'id')::bigint = allowed_row) then
+    raise exception '投递前复核只应针对正在发送的行，非 sending 的行必须被忽略';
   end if;
 
   update public.settings set email_notify_enabled = false where id = 1;

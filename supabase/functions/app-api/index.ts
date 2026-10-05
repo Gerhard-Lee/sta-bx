@@ -38,8 +38,9 @@ const STATUS_LABELS: Record<string, string> = {
   payment_pending: '待付款', paid: '已付款', cancelled: '已撤回',
 }
 // 每个事件对应“仍然成立”的状态：领取之后、真正发送之前复核一次。
-// 待办类状态变了（被别人处理、被撤回、收款人换了）就不再催；结果类（拒绝/已付款）是终态，
-// 复核只是防止“申请状态后来又被改动”这种异常，绝不会把新加的结果通知误判成过期。
+// 待办类状态变了（被别人处理、被撤回、收款人换了）就不再催。
+// 结果类（拒绝/已付款）对应终态：申请一旦再次变化（例如被拒绝后重新提交），
+// 版本复核与状态复核都会把这封已经不再成立的待发提醒作废——这是有意的，不是"误判"。
 const NOTIFY_EVENT_STATUS: Record<string, string> = {
   '待财委审批': 'finance_pending',
   '待主席审批': 'chair_pending',
@@ -54,26 +55,32 @@ const NOTIFY_BATCH = 100
 const NOTIFY_ROUNDS = 8
 const NOTIFY_CONCURRENCY = 5
 const NOTIFY_SEND_TIMEOUT_MS = 15000
-const NOTIFY_LEASE_SECONDS = 300
 const NOTIFY_MAX_AGE_HOURS = 24
 const NOTIFY_MAX_ATTEMPTS = 5
 const NOTIFY_BACKOFF_CAP_MINUTES = 60
 // 一轮消费最多跑这么久。托管免费方案的 worker 墙钟上限与请求 idle timeout 都是 150 秒
 // （https://supabase.com/docs/guides/functions/limits），所以默认预算必须明显低于 150 秒：
 // 被平台硬杀的话，剩余的行会卡在“发送中”、按中断累加失败次数，正常积压也可能耗尽重试预算。
-// 自托管可以调大：环境变量 NOTIFY_MAX_RUNTIME_MS（毫秒），钳在 30 秒–15 分钟之间。
-const NOTIFY_MIN_RUNTIME_MS = 30000
-const NOTIFY_MAX_RUNTIME_LIMIT_MS = 900000
-const NOTIFY_DEFAULT_RUNTIME_MS = 110000
-const configuredRuntimeMs = Number(Deno.env.get('NOTIFY_MAX_RUNTIME_MS') ?? '')
-const NOTIFY_MAX_RUNTIME_MS = Number.isFinite(configuredRuntimeMs) && configuredRuntimeMs > 0
-  ? Math.min(Math.max(configuredRuntimeMs, NOTIFY_MIN_RUNTIME_MS), NOTIFY_MAX_RUNTIME_LIMIT_MS)
-  : NOTIFY_DEFAULT_RUNTIME_MS
+// 自托管可以调大：环境变量 NOTIFY_MAX_RUNTIME_MS（毫秒），钳在下面算出的下限与上限之间。
 // 投递一个发送组（最多 5 封并发、单封 15 秒超时）加上写回，以及收尾时把没发送的行退回队列与写审计。
 // 每开始一组之前判断“剩下的时间够不够跑完这一组并收尾”，而不是只判断是否大于 0：
 // 否则最后一组会被平台掐断，那些行只能等租约到期、白吃一次尝试次数。
 const NOTIFY_GROUP_BUDGET_MS = NOTIFY_SEND_TIMEOUT_MS + 5000
 const NOTIFY_WRAPUP_BUDGET_MS = 20000
+// 下限必须大于“一组 + 收尾”（40 秒），否则每轮都会在跑第一组之前就退出、一封也发不出去；
+// 再留一个单封超时，保证至少能完整跑完一组。
+const NOTIFY_MIN_RUNTIME_MS = NOTIFY_GROUP_BUDGET_MS + NOTIFY_WRAPUP_BUDGET_MS + NOTIFY_SEND_TIMEOUT_MS
+// 上限压在租约上限（900 秒）之内：租约是按预算派生的（见下），预算比租约长的话，
+// 本轮最先领取的行会在中途过期、被另一批（例如 5 分钟后的 cron）抢走并可能重复投递。
+const NOTIFY_LEASE_LIMIT_SECONDS = 900
+const NOTIFY_MAX_RUNTIME_LIMIT_MS = 840000
+const NOTIFY_DEFAULT_RUNTIME_MS = 110000
+const configuredRuntimeMs = Number(Deno.env.get('NOTIFY_MAX_RUNTIME_MS') ?? '')
+const NOTIFY_MAX_RUNTIME_MS = Number.isFinite(configuredRuntimeMs) && configuredRuntimeMs > 0
+  ? Math.min(Math.max(configuredRuntimeMs, NOTIFY_MIN_RUNTIME_MS), NOTIFY_MAX_RUNTIME_LIMIT_MS)
+  : NOTIFY_DEFAULT_RUNTIME_MS
+// 租约 = 预算 + 60 秒余量（至少 5 分钟，最多 900 秒，与 app_claim_notifications 的取值上限一致）。
+const NOTIFY_LEASE_SECONDS = Math.min(NOTIFY_LEASE_LIMIT_SECONDS, Math.max(300, Math.ceil(NOTIFY_MAX_RUNTIME_MS / 1000) + 60))
 // 邮件服务返回 429（限频）时暂停本轮、按 Retry-After 稍后重试：这是“等一等就好”，不消耗尝试次数，
 // 否则中继的每分钟限频会把正常积压误判成永久失败。
 const NOTIFY_THROTTLE_MIN_WAIT_SECONDS = 30
@@ -252,6 +259,7 @@ async function handle(req: Request) {
     let cancelled = 0
     let deferred = 0
     let discarded = 0
+    let recheckFailures = 0
     let rounds = 0
     const startedAt = Date.now()
     const timeLeft = () => NOTIFY_MAX_RUNTIME_MS - (Date.now() - startedAt)
@@ -281,10 +289,13 @@ async function handle(req: Request) {
       // 写回结果必须同时匹配 id、发送中状态和批次号：租约过期被别的批次领走后就写不进去了。
       // touched 记录本轮真正写回成功的行；收尾时把没动过的行原样退回队列，不让它们卡在“发送中”。
       // 写回失败（PostgREST 出错、网络抖动）不算已处理：该行不进 touched，计数也不加，审计不会虚报。
+      // 另外用 `.select('id')` 拿回写结果：0 行命中也可能是“这一行早被别人抢走了”，那同样不算我们处理成功
+      // （不这样判断的话，重复投递与计数虚报都看不出来——PostgREST 默认不返回 representation 也不报错）。
       const touched = new Set<number>()
       const settle = async (note: Record<string, any>, fields: Record<string, unknown>) => {
-        const { error } = await admin.from('notifications').update(fields).eq('id', note.id).eq('status', 'sending').eq('claim_id', claimId)
+        const { data, error } = await admin.from('notifications').update(fields).eq('id', note.id).eq('status', 'sending').eq('claim_id', claimId).select('id')
         if (error) return false
+        if (!Array.isArray(data) || data.length !== 1) return false
         touched.add(note.id)
         return true
       }
@@ -298,14 +309,28 @@ async function handle(req: Request) {
       // 每组 5 封并发，后面的行可能等很久。管理员撤角色或关类型就发生在这个窗口里，而入库时的判定已经过期。
       // 复核交给数据库（private.app_user_has_role + settings.email_notify_events），客户端不重写规则；
       // 只返回"不该再发"的行与原因，被挡下的就地作废，不进入发送。
+      // 复核本身失败（PostgREST 暂时不可用、schema 缓存未刷新）不能让整轮崩掉：把这一组原样退回队列、
+      // 记下原因并结束本轮——否则这一个 RPC 出错会让最多 100 行卡在“发送中”，5 轮之后按“连续未完成”
+      // 全部转 failed，本来该发的提醒一封都发不出去，而且审计里什么也看不到。
       const recheckGroup = async (group: Record<string, any>[]) => {
         if (!group.length) return group
-        const blocked = await rpc('app_notify_blocked_rows', { p_ids: group.map((note) => note.id) })
-        const reasons = new Map<number, string>((Array.isArray(blocked) ? blocked : []).map((row: Record<string, any>) => [Number(row.id), String(row.reason ?? '')]))
+        let blocked: unknown
+        try {
+          blocked = await rpc('app_notify_blocked_rows', { p_ids: group.map((note) => note.id) })
+        } catch (error) {
+          recheckFailures++
+          console.error(`notify recheck failed: ${error instanceof Error ? error.message : 'unknown'}`)
+          for (const note of group) {
+            if (await settle(note, { status: 'pending', claim_id: null, lease_expires_at: new Date().toISOString(), next_attempt_at: new Date().toISOString(), last_error: '投递前复核暂时失败，已退回队列' })) deferred++
+          }
+          return []
+        }
+        // 出现在结果里就是"被挡下"：reason 缺失/为空只影响文案，不能把它当成放行（那是调用方契约的漏洞）。
+        const reasons = new Map<number, string>((Array.isArray(blocked) ? blocked : []).map((row: Record<string, any>) => [Number(row.id), String(row.reason ?? '') || '投递前复核未通过，提醒已作废']))
         const allowed: Record<string, any>[] = []
         for (const note of group) {
           const reason = reasons.get(Number(note.id))
-          if (!reason) {
+          if (reason === undefined) {
             allowed.push(note)
             continue
           }
@@ -388,6 +413,8 @@ async function handle(req: Request) {
         // 那些行只能等租约到期、白吃一次尝试次数。
         if (timeLeft() < NOTIFY_GROUP_BUDGET_MS + NOTIFY_WRAPUP_BUDGET_MS || throttleWait > 0) { stop = true; break }
         const group = await recheckGroup(rows.slice(index, index + NOTIFY_CONCURRENCY))
+        // 复核接口挂了就不要再往下试：本组已退回队列，本轮到此为止，下一轮再重试。
+        if (recheckFailures > 0) { stop = true; break }
         if (group.length) await Promise.all(group.map(sendOne))
       }
       if (stop) {
@@ -404,8 +431,10 @@ async function handle(req: Request) {
     const { count: pendingLeft, error: pendingError } = await admin.from('notifications').select('*', { count: 'exact', head: true }).eq('status', 'pending')
     if (pendingError) throw new Error('通知队列读取失败。')
     // 审计里写清本轮的预算与开启的提醒类型：配额上限与"管理员关了哪几类"是排查"为什么没收到"的第一手信息。
-    await audit(actorId, '发送邮件提醒', `${actorId ? '管理员' : '定时任务'}处理 ${rounds} 轮（预算 ${Math.round(NOTIFY_MAX_RUNTIME_MS / 1000)} 秒，已开启提醒类型 ${enabledEvents.length} 类）：发送 ${sent} 封，失败 ${failed} 封，稍后重试 ${retried} 封，作废 ${cancelled} 封，本轮退回 ${deferred} 封，丢弃 ${discarded} 封，剩余待发送 ${pendingLeft ?? 0} 封`)
-    return ok({ sent, failed, retried, cancelled, deferred, discarded, rounds, pending: pendingLeft ?? 0 })
+    // 复核失败必须留下痕迹——否则"什么都没发生"和"复核接口挂了"在日志里长得一样。
+    const recheckNote = recheckFailures > 0 ? `；投递前复核失败 ${recheckFailures} 组，相关提醒已退回队列` : ''
+    await audit(actorId, '发送邮件提醒', `${actorId ? '管理员' : '定时任务'}处理 ${rounds} 轮（预算 ${Math.round(NOTIFY_MAX_RUNTIME_MS / 1000)} 秒，已开启提醒类型 ${enabledEvents.length} 类）：发送 ${sent} 封，失败 ${failed} 封，稍后重试 ${retried} 封，作废 ${cancelled} 封，本轮退回 ${deferred} 封，丢弃 ${discarded} 封，剩余待发送 ${pendingLeft ?? 0} 封${recheckNote}`)
+    return ok({ sent, failed, retried, cancelled, deferred, discarded, recheck_failed: recheckFailures, rounds, pending: pendingLeft ?? 0 })
   }
 
   if (action === 'public_settings') {

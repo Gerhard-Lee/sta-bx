@@ -35,7 +35,8 @@ const VARIANTS = {
 
 // 生成产物必须落在工作区里：Node 从模块所在目录向上找 node_modules，
 // 放进 os.tmpdir() 的话连裸导入都解析不到。
-const BUILD_ROOT = path.join(PROJECT_ROOT, 'tests', '.tmp');
+// 用本文件自己的子目录：不能删 tests/.tmp 整个目录（那是共享暂存区，别的进程/测试也在用）。
+const BUILD_ROOT = path.join(PROJECT_ROOT, 'tests', '.tmp', 'app-api-notify');
 const STUB_FILE = path.join(BUILD_ROOT, 'supabase-js-stub.mjs');
 const BUNDLE_FILE = path.join(BUILD_ROOT, 'app-api.bundle.mjs');
 
@@ -79,7 +80,8 @@ async function buildHandler() {
   return built;
 }
 
-test.after(() => { rmSync(BUILD_ROOT, { recursive: true, force: true }); });
+// 生成物用完即删；Windows 上偶发 EPERM（模块文件句柄还没释放），删不掉也无害——目录已在 .gitignore 里。
+test.after(() => { try { rmSync(BUILD_ROOT, { recursive: true, force: true }); } catch { /* 留到下次运行覆盖 */ } });
 
 // ---------------------------------------------------------------- 测试夹具与工具
 
@@ -174,6 +176,8 @@ function captureEmails() {
 }
 
 // 走定时任务入口（x-app-cron），handle() 会调用同一个 drainNotifications(null)。
+// 注意 extraEnv 只在每次请求前注入 Deno.env：对 APP_URL / CRON_SECRET 这类"每次读取"的变量有效；
+// 模块级常量（NOTIFY_MAX_RUNTIME_MS、NOTIFY_* 预算）在 import 时就固化了，改它们必须换 variant。
 async function drain(client, { variant = 'default', extraEnv = {} } = {}) {
   const { variants } = await buildHandler();
   const { handler, env } = variants[variant];
@@ -352,8 +356,61 @@ test('消费预算可由 NOTIFY_MAX_RUNTIME_MS 覆盖并写进审计，默认值
   const defaultRuntimeMs = Number(match[1]);
   assert.ok(defaultRuntimeMs > 0, '默认预算应为正数');
   assert.ok(defaultRuntimeMs < 150000, `默认预算 ${defaultRuntimeMs}ms 必须低于 150 秒`);
-  assert.match(API_SOURCE_TEXT, /NOTIFY_MIN_RUNTIME_MS = 30000/);
-  assert.match(API_SOURCE_TEXT, /NOTIFY_MAX_RUNTIME_LIMIT_MS = 900000/);
+  // 下限必须高于"一组 + 收尾"，否则每轮会在第一组之前退出、一封都发不出去。
+  // 数字全部从源码常量推出（不抄硬编码），并确认停止阈值用的就是这两个余量。
+  const sendTimeout = Number(API_SOURCE_TEXT.match(/const NOTIFY_SEND_TIMEOUT_MS = (\d+)/)[1]);
+  const groupBudget = sendTimeout + 5000;
+  const wrapupBudget = Number(API_SOURCE_TEXT.match(/const NOTIFY_WRAPUP_BUDGET_MS = (\d+)/)[1]);
+  const minRuntime = groupBudget + wrapupBudget + sendTimeout;
+  assert.match(API_SOURCE_TEXT, /const NOTIFY_MIN_RUNTIME_MS = NOTIFY_GROUP_BUDGET_MS \+ NOTIFY_WRAPUP_BUDGET_MS \+ NOTIFY_SEND_TIMEOUT_MS/);
+  assert.match(API_SOURCE_TEXT, /if \(timeLeft\(\) < NOTIFY_GROUP_BUDGET_MS \+ NOTIFY_WRAPUP_BUDGET_MS\) break/);
+  assert.ok(minRuntime > groupBudget + wrapupBudget, `下限 ${minRuntime}ms 必须严格大于阈值 ${groupBudget + wrapupBudget}ms，否则第一组之前就退出`);
+  assert.ok(defaultRuntimeMs > minRuntime, `默认预算 ${defaultRuntimeMs}ms 必须大于下限 ${minRuntime}ms`);
+  assert.ok(minRuntime < 150000, `下限 ${minRuntime}ms 也必须留在免费方案 150 秒墙钟之内`);
+  // 上限必须留在租约上限之内，否则本轮最先领取的行会在中途被别的批次抢走（可能重复投递）。
+  const limitRuntimeMs = Number(API_SOURCE_TEXT.match(/const NOTIFY_MAX_RUNTIME_LIMIT_MS = (\d+)/)[1]);
+  const leaseLimitSeconds = Number(API_SOURCE_TEXT.match(/const NOTIFY_LEASE_LIMIT_SECONDS = (\d+)/)[1]);
+  assert.equal(leaseLimitSeconds, 900, '租约上限应与 app_claim_notifications 的取值上限一致');
+  assert.ok(limitRuntimeMs / 1000 + 60 <= leaseLimitSeconds, `预算上限 ${limitRuntimeMs}ms 派生出的租约必须不超过 ${leaseLimitSeconds}s`);
+  assert.match(API_SOURCE_TEXT, /const NOTIFY_LEASE_SECONDS = Math\.min\(NOTIFY_LEASE_LIMIT_SECONDS, Math\.max\(300, Math\.ceil\(NOTIFY_MAX_RUNTIME_MS \/ 1000\) \+ 60\)\)/);
+});
+
+test('投递前复核接口失败时不烧队列：本组退回 pending、写审计，不累加尝试次数', { timeout: SQL_STACK_TIMEOUT }, async () => {
+  const { db } = await stack();
+  const fixture = await new Fixture(db).init();
+  const client = createSqlClient(db);
+  // 只让 app_notify_blocked_rows 出错（模拟 PostgREST schema 缓存未刷新/暂时不可用），其余 RPC 正常。
+  const brokenClient = {
+    ...client,
+    rpc: (name, args) => (name === 'app_notify_blocked_rows'
+      ? Promise.resolve({ data: null, error: { message: 'PGRST002 could not query the database for the schema cache' } })
+      : client.rpc(name, args)),
+  };
+
+  await fixture.setEmailNotify(true, DEFAULT_EVENTS);
+  const owner = await fixture.user('owner_recheck_fail', { email: 'recheck-owner@example.com' });
+  const finance = await fixture.user('finance_recheck_fail', { email: 'recheck-finance@example.com', roles: ['finance'] });
+  const applicationId = await fixture.application(owner, { title: '复核接口挂了也不能烧队列' });
+  await fixture.setStatus(applicationId, 'finance_pending', 1);
+  assert.equal((await fixture.notification(applicationId)).rows.length, 1, '待财委审批应在队列里生成 1 行');
+
+  const result = await drain(brokenClient);
+  assert.equal(result.status, 200, JSON.stringify(result.payload));
+  assert.equal(result.payload.error, null);
+  assert.equal(result.payload.data.sent, 0, '复核失败时不能寄出任何邮件');
+  assert.equal(result.emails.length, 0);
+  assert.ok(result.payload.data.recheck_failed >= 1, `应记录复核失败次数，实际 ${JSON.stringify(result.payload.data)}`);
+
+  const after = await fixture.notification(applicationId);
+  assert.equal(after.row.status, 'pending', '被复核失败挡住的行必须退回队列，不能卡在 sending');
+  assert.equal(after.row.claim_id, null, '退回后应释放批次号');
+  assert.equal(after.row.attempts, 0, '这是基础设施故障，不能消耗投递尝试次数');
+  assert.match(after.row.last_error, /投递前复核暂时失败/);
+
+  const audit = await fixture.latestAudit('发送邮件提醒');
+  assert.ok(audit, '复核失败也要写审计，否则日志里什么都看不到');
+  assert.match(audit.detail, /投递前复核失败 1 组/);
+  assert.equal(after.row.recipient_user_id, finance, '退回的那一行仍指向原来的收件人');
 });
 
 test('结果通知开关：拒绝申请未勾选时入队被拒，勾选后出现该行', { timeout: SQL_STACK_TIMEOUT }, async () => {

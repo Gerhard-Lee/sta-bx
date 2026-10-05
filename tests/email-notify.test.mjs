@@ -80,11 +80,11 @@ test('七类提醒与四处清单一致：待办五类 + 拒绝申请/已付款�
   assert.deepEqual(settingsCheck.split(',').map((item) => item.trim().replaceAll("'", '')), NOTIFY_EVENTS);
   assert.deepEqual(NOTIFY_EVENT_STATUS_FROM_API().map(([event]) => event), NOTIFY_EVENTS);
   assert.deepEqual(NOTIFY_EVENT_GROUPS.flatMap((group) => group.events), NOTIFY_EVENTS);
-  assert.match(verify, /退回修改应提醒申请人本人/);
-  assert.match(verify, /待补充收款码应提醒申请人本人/);
+  assert.match(verify, /退回修改只应发给申请人本人/);
+  assert.match(verify, /待补充收款码只应发给申请人本人/);
   assert.match(verify, /完结态不应生成队列记录/);
   assert.match(verify, /打开结果通知后，拒绝申请应提醒申请人本人/);
-  assert.match(verify, /打开结果通知后，已付款应提醒申请人本人/);
+  assert.match(verify, /已付款只应发给申请人本人/);
   assert.match(verify, /拒绝申请只应发给申请人本人/);
 });
 test('收件人由服务端按状态推导：审批事件给对应角色且跳过申请人本人', () => {
@@ -178,7 +178,10 @@ test('队列消费参数在前端、后端与数据库取值范围三方一致',
   assert.match(api, new RegExp(`const NOTIFY_ROUNDS = ${NOTIFY_QUEUE.rounds}\\b`));
   assert.match(api, new RegExp(`const NOTIFY_CONCURRENCY = ${NOTIFY_QUEUE.concurrency}\\b`));
   assert.match(api, new RegExp(`const NOTIFY_SEND_TIMEOUT_MS = ${NOTIFY_QUEUE.sendTimeoutMs}\\b`));
-  assert.match(api, new RegExp(`const NOTIFY_LEASE_SECONDS = ${NOTIFY_QUEUE.leaseSeconds}\\b`));
+  // 租约不再写死：它按预算派生（预算 + 60 秒，至少 5 分钟、最多 900 秒），保证整轮预算不会超出自己的租约。
+  assert.match(api, new RegExp(`const NOTIFY_LEASE_LIMIT_SECONDS = ${NOTIFY_QUEUE.leaseSeconds * 3}\\b`));
+  assert.match(api, /const NOTIFY_LEASE_SECONDS = Math\.min\(NOTIFY_LEASE_LIMIT_SECONDS, Math\.max\(300, Math\.ceil\(NOTIFY_MAX_RUNTIME_MS \/ 1000\) \+ 60\)\)/);
+  assert.ok(NOTIFY_QUEUE.leaseSeconds * 1000 > NOTIFY_QUEUE.sendTimeoutMs, '默认租约必须比单封超时更久，否则慢批次会被别人抢走');
   assert.match(api, new RegExp(`const NOTIFY_MAX_AGE_HOURS = ${NOTIFY_QUEUE.maxAgeHours}\\b`));
   assert.match(api, new RegExp(`const NOTIFY_MAX_ATTEMPTS = ${NOTIFY_QUEUE.maxAttempts}\\b`));
   assert.match(api, new RegExp(`const NOTIFY_BACKOFF_CAP_MINUTES = ${NOTIFY_QUEUE.backoffCapMinutes}\\b`));
@@ -188,8 +191,14 @@ test('队列消费参数在前端、后端与数据库取值范围三方一致',
   assert.ok(NOTIFY_QUEUE.maxRuntimeMs > NOTIFY_QUEUE.sendTimeoutMs * 3, '默认预算至少要够跑几个发送组');
   assert.match(api, /Deno\.env\.get\('NOTIFY_MAX_RUNTIME_MS'\)/);
   assert.match(api, /Math\.min\(Math\.max\(configuredRuntimeMs, NOTIFY_MIN_RUNTIME_MS\), NOTIFY_MAX_RUNTIME_LIMIT_MS\)/);
-  assert.match(api, /const NOTIFY_MIN_RUNTIME_MS = 30000/);
-  assert.match(api, /const NOTIFY_MAX_RUNTIME_LIMIT_MS = 900000/);
+  assert.match(api, /const NOTIFY_MAX_RUNTIME_LIMIT_MS = 840000/);
+  assert.match(api, /const NOTIFY_LEASE_LIMIT_SECONDS = 900/);
+  // 下限必须高于"一组 + 收尾"，否则每轮都会在第一组之前退出、一封都发不出去（实测过的坑）。
+  assert.match(api, /const NOTIFY_MIN_RUNTIME_MS = NOTIFY_GROUP_BUDGET_MS \+ NOTIFY_WRAPUP_BUDGET_MS \+ NOTIFY_SEND_TIMEOUT_MS/);
+  const groupBudget = NOTIFY_QUEUE.sendTimeoutMs + 5000;
+  const minBudget = groupBudget + 20000 + NOTIFY_QUEUE.sendTimeoutMs;
+  assert.ok(minBudget > groupBudget + 20000, '配置下限必须大于一组预算 + 收尾余量');
+  assert.ok(NOTIFY_QUEUE.maxRuntimeMs > minBudget, '默认预算必须大于配置下限');
   assert.match(migration, /p_limit < 1 or p_limit > 200/);
   assert.match(migration, /p_lease_seconds < 30 or p_lease_seconds > 900/);
   assert.match(migration, /p_max_age_hours < 1 or p_max_age_hours > 168/);
@@ -273,7 +282,7 @@ test('投递前复核每个发送组：领取之后被撤身份或关类型的�
   const drain = slice(api, 'const drainNotifications = async', "const { count: pendingLeft");
   // handler 侧：每组之前调用数据库复核，被挡下的行作废并计进"已作废"，合格的行才进入发送。
   assert.match(drain, /const recheckGroup = async \(group: Record<string, any>\[\]\) => \{/);
-  assert.match(drain, /const blocked = await rpc\('app_notify_blocked_rows', \{ p_ids: group\.map\(\(note\) => note\.id\) \}\)/);
+  assert.match(drain, /blocked = await rpc\('app_notify_blocked_rows', \{ p_ids: group\.map\(\(note\) => note\.id\) \}\)/);
   assert.match(drain, /if \(await settle\(note, \{ status: 'cancelled', claim_id: null, last_error: reason\.slice\(0, 300\) \}\)\) cancelled\+\+/);
   assert.match(drain, /const group = await recheckGroup\(rows\.slice\(index, index \+ NOTIFY_CONCURRENCY\)\)/);
   assert.match(drain, /if \(group\.length\) await Promise\.all\(group\.map\(sendOne\)\)/);
@@ -283,6 +292,9 @@ test('投递前复核每个发送组：领取之后被撤身份或关类型的�
   assert.match(migration, /and n\.status = 'sending'\s+and blocked\.reason is not null/);
   assert.match(migration, /revoke all on function public\.app_notify_blocked_rows\(bigint\[\]\) from public, anon, authenticated/);
   assert.match(migration, /grant execute on function public\.app_notify_blocked_rows\(bigint\[\]\) to service_role/);
+  // 投递前复核只看逐类开关，不看总开关：总开关是暂停（下一轮 skipped），不是"该类型被关闭"的作废理由。
+  assert.match(migration, /when not exists\(select 1 from public\.settings s where s\.id = 1 and n\.event = any\(s\.email_notify_events\)\)\s+then '管理员已关闭「' \|\| n\.event \|\| '」提醒，本封已作废'/);
+  assert.equal(/app_notify_blocked_rows[\s\S]{0,900}s\.email_notify_enabled/.test(migration), false, '投递前复核不应把总开关当成作废条件');
   assert.match(verify, /领取后撤销身份的行应被投递前复核挡下/);
   assert.match(verify, /身份仍有效的行不应被投递前复核挡下/);
 });
@@ -372,8 +384,10 @@ test('发送时跳过已停用收件人和不存在的申请，失败按 2 的�
 test('写回失败不算已处理：计数只在写回成功后增加，行留给退回步骤或租约', () => {
   const drain = slice(api, 'const drainNotifications = async', "const { count: pendingLeft");
   // settle 返回是否写回成功；失败时该行不进 touched，于是会被收尾的退回步骤重新处理。
-  assert.match(drain, /const \{ error \} = await admin\.from\('notifications'\)\.update\(fields\)\.eq\('id', note\.id\)\.eq\('status', 'sending'\)\.eq\('claim_id', claimId\)/);
-  assert.match(drain, /if \(error\) return false[\s\S]{0,40}touched\.add\(note\.id\)[\s\S]{0,20}return true/);
+  // 用 `.select('id')` 拿回写结果：0 行命中也算失败（那一行已经被别的批次抢走），否则计数与重复投递都看不出来。
+  assert.match(drain, /const \{ data, error \} = await admin\.from\('notifications'\)\.update\(fields\)\.eq\('id', note\.id\)\.eq\('status', 'sending'\)\.eq\('claim_id', claimId\)\.select\('id'\)/);
+  assert.match(drain, /if \(!Array\.isArray\(data\) \|\| data\.length !== 1\) return false/);
+  assert.match(drain, /if \(error\) return false[\s\S]{0,80}touched\.add\(note\.id\)[\s\S]{0,20}return true/);
   // 每种终局都在写回成功后才计数，审计里的数字不虚报。
   const sendOne = slice(api, 'const sendOne = async', 'for (let index = 0;');
   for (const counter of ['sent\\+\\+', 'failed\\+\\+', 'cancelled\\+\\+', 'retried\\+\\+']) {
@@ -407,7 +421,11 @@ test('定时消费用 pg_cron，缺扩展或未配置时只提示不阻塞，且
   assert.match(cron, /create or replace function public\.app_register_email_cron\(\)/);
   assert.match(cron, /cron\.schedule\(%L, %L, %L\)/);
   assert.match(cron, /job_name, '\*\/5 \* \* \* \*'/);
-  assert.match(cron, /'x-app-cron', cron_secret/);
+  assert.match(cron, /'x-app-cron', p_cron_secret/);
+  // pg_net 的 timeout_milliseconds 现在真的生效（官方文档 default 2000 毫秒）：必须显式传，否则一轮消费几秒就被掐断。
+  assert.match(cron, /timeout_milliseconds := %s/);
+  assert.match(cron, /stabx\.email_cron_timeout_ms/);
+  assert.match(cron, /declare cron_timeout_ms integer := case when raw_timeout ~ '\^\[0-9\]\+\$' then raw_timeout::integer else 140000 end/);
   assert.match(cron, /current_setting\('stabx\.email_cron_secret', true\)/);
   assert.match(cron, /not exists\(select 1 from pg_available_extensions where name = 'pg_cron'\)/);
   assert.match(cron, /for old_job in select jobid from cron\.job where jobname = job_name loop/);
@@ -427,6 +445,16 @@ test('迁移先检查散装 SQL 的前置依赖，避免运行期才报函数不
   assert.match(migration, /if to_regprocedure\('public\.app_set_member_roles\(uuid,uuid,text\[\],boolean\)'\) is null then/);
   assert.match(migration, /if to_regprocedure\('private\.app_user_has_role\(uuid,text\)'\) is null then/);
   assert.match(readme, /supabase\/admin-settings-audit\.sql/);
+});
+test('状态中文标签在 app-api 与前端两份拷贝之间逐项一致', () => {
+  // 这两份是各自独立的拷贝（Edge Function 不能引用前端模块、前端也不引用函数），没有任何运行期约束，
+  // 只能靠这条契约测试挡住"改一处忘另一处"。
+  const apiLabels = [...slice(api, 'const STATUS_LABELS: Record<string, string> = {', '}').matchAll(/([a-z_]+): '([^']+)'/g)].map((match) => [match[1], match[2]]);
+  const mainLabels = [...slice(main, 'const STATUS = {', '};').matchAll(/([a-z_]+): '([^']+)'/g)].map((match) => [match[1], match[2]]);
+  for (const status of ['draft', 'finance_pending', 'chair_pending', 'changes_requested', 'rejected', 'payment_info_required', 'payment_pending', 'paid', 'cancelled']) {
+    assert.ok(apiLabels.some(([key]) => key === status), `app-api 的 STATUS_LABELS 缺少 ${status}`);
+  }
+  assert.deepEqual(mainLabels, apiLabels, '两端的状态中文标签必须逐项一致');
 });
 test('管理员列表只回传是否绑定邮箱，不回传地址本身', () => {
   assert.match(api, /has_email: bound\.has\(row\.id\)/);
@@ -486,8 +514,8 @@ test('迁移行为验证真的驱动状态变化，而不是只看对象是否�
   for (const needed of [
     'insert into public.applications(owner_id, title, purpose, amount, category, department, use_date, status, version)',
     "update public.applications set status = 'finance_pending', version = 1 where id = app_id;",
-    '已绑定邮箱的财委应收到待审批提醒',
-    '申请人本人、未绑定邮箱和已停用的成员都不应入队',
+    '待财委审批的收件人应恰好是财委与内置 admin',
+    '待主席审批的收件人应恰好是主席与内置 admin',
     'public.app_claim_notifications(claim_1, 200, 300, 24, 5)',
     '已领取的行必须处于发送中',
     '领取必须带上未过期的租约',
@@ -500,8 +528,14 @@ test('迁移行为验证真的驱动状态变化，而不是只看对象是否�
     '领取后撤销身份的行应被投递前复核挡下',
     '关闭类型后已积压的该类提醒应作废',
     '打开结果通知后，拒绝申请应提醒申请人本人',
+    '无身份成员不应收到任何提醒',
+    '投递前复核只应针对正在发送的行',
+    '超龄 sending 行恢复丢弃时应计入 discarded',
     '普通成员不应能修改提醒设置',
   ]) assert.ok(verify.includes(needed), `验证脚本缺少：${needed}`);
+  // 这两条曾经是恒真断言（拿第二批返回的 id 去比第一批的 claim_id）；现在改成比较两批的 id 交集。
+  assert.match(verify, /intersect\s+select unnest\(claim_1_ids\)/);
+  assert.equal(/claim_id = claim_1 and id in \(\s*select \(element->>'id'\)::bigint from jsonb_array_elements/.test(verify), false, '不允许再写恒真的双批次断言');
   assert.equal(/\binsert into public\.notifications\b/.test(verify), false, '队列记录必须由触发器产生，验证不能自己插行');
 });
 test('README 说明密钥、执行顺序与两种消费入口', () => {

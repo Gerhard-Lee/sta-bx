@@ -19,7 +19,7 @@
 | `20261002133000_separate_admin_and_workflow_roles.sql` + verify | 管理员与流程身份分离；新增 `app_user_is_superadmin`，只有内置 `admin` 跨身份 |
 | `20261004210000_email_notify.sql` + verify | 邮箱绑定、七类事件的通知队列与触发器、`settings.email_notify_events` 逐类开关、带租约的原子领取（五参数：批次号/上限/租约秒/超龄小时/失败上限）、领取时身份/版本/类型复核与 `app_notify_blocked_rows` 投递前复核、发送前状态复核与 `cancelled` 终态、依赖 fail-fast 检查 |
 | `20261005010000_finance_can_record_payment.sql` + verify | 付款登记视同财委身份：重定义 `private.app_user_has_role`，让 `finance` 通过 `cashier` 判定（PR #15 已合并）；通知触发器无需改动即继承新语义 |
-| `20261005140000_email_notify_cron.sql` + verify | 可选的 pg_cron 登记函数 `app_register_email_cron()`；缺扩展或未配置参数时只输出提示并跳过 |
+| `20261005140000_email_notify_cron.sql` + verify | 可选的 pg_cron 登记函数 `app_register_email_cron()`（探测扩展与 GUC，缺扩展或未配置参数时只输出提示并跳过）；登记逻辑抽成 `private.app_schedule_email_cron(...)`，显式传 pg_net 的 `timeout_milliseconds`（默认 140 秒，可用 `stabx.email_cron_timeout_ms` 调大）；verify 在没有真实 pg_cron 的测试库里用 cron 桩直接验证登记 SQL |
 
 **它们之间有真实依赖**：`20261004210000_email_notify.sql` 重写的 `app_admin_create_user` 调用 `private.app_insert_user`，而后者只在 `admin-settings-audit.sql` 里定义。plpgsql 函数体在建函数时不解析引用，所以缺依赖**不会在迁移时报错，而是等到有人点"添加用户"才炸**。因此该迁移开头有一道 fail-fast：
 

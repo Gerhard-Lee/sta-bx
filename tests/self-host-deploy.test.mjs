@@ -93,10 +93,14 @@ test('curl 超时必须大于函数一轮的消费预算，否则客户端先断
   const composeBudget = seconds(override, /NOTIFY_MAX_RUNTIME_MS:-(\d+)/);
   assert.ok(composeBudget > NOTIFY_QUEUE.maxRuntimeMs, '自托管覆盖的预算应当大于托管默认值');
   assert.ok(seconds(drain, /STABX_NOTIFY_TIMEOUT:-(\d+)/) > composeBudget / 1000, 'drain.sh 的超时必须大于自托管覆盖里的预算');
-  // pg_net 的 timeout_milliseconds 目前被忽略，所以定时 SQL 有意不传它，靠函数侧预算收尾。
+  assert.ok(seconds(source('deploy/drain.env.example'), /STABX_NOTIFY_TIMEOUT=(\d+)/) > composeBudget / 1000, 'drain.env.example 的超时也必须大于自托管覆盖里的预算');
+  // pg_net 的 timeout_milliseconds 现在真的生效（官方文档 default 2000 毫秒）：定时 SQL 必须显式传，
+  // 而且要大于函数侧一轮预算，否则一轮消费几秒就被掐断、剩余行卡在"发送中"。
   const cronSql = source('supabase/migrations/20261005140000_email_notify_cron.sql');
-  assert.equal(/timeout_milliseconds\s*:=/.test(cronSql), false, 'pg_net 的超时参数目前无效，不要传');
-  assert.match(cronSql, /目前被忽略/);
+  assert.match(cronSql, /timeout_milliseconds := %s/, '定时 SQL 必须显式传 pg_net 超时');
+  assert.match(cronSql, /else 140000 end/, '默认超时应是函数默认预算 110 秒 + 30 秒余量');
+  assert.ok(140000 / 1000 > budgetSeconds, 'pg_net 默认超时必须大于函数默认预算');
+  assert.match(cronSql, /stabx\.email_cron_timeout_ms/, '自托管调大预算时要能用 GUC 同步调大超时');
 });
 test('自检脚本覆盖六层，且失败会让退出码非 0', () => {
   for (const needed of ['s_client -connect', '/health', '"$code" = "401"', '/send', 'from public.notifications group by status', 'email_notify_enabled', 'drain.sh']) assert.ok(check.includes(needed), `自检缺少一层：${needed}`);
