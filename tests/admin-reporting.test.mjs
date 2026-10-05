@@ -33,8 +33,7 @@ test('日志导出包含完整 IP、用户名、秒级时间、具体内容及�
 });
 test('注册开关、添加用户和导出端点均在后端检查管理员权限', () => {
   const source = readFileSync('supabase/functions/app-api/index.ts','utf8');
-  for (const action of ['update_registration', 'admin_create_user']) assert.match(source, new RegExp(`action === '${action}'[\\s\\S]{0,50}requireRole\\(actor, 'admin'\\)`));
-  assert.match(source, /action === 'export_financial' \|\| action === 'export_audit'[\s\S]{0,60}requireRole\(actor, 'admin'\)/);
+  for (const action of ['update_registration', 'admin_create_user', 'export_financial', 'export_audit']) assert.match(source, new RegExp(`action === '${action}'[\\s\\S]{0,50}requireRole\\(actor, 'admin'\\)`));
   assert.ok(!source.includes('p_password: body.password')); // Only typed validated payloads enter account RPCs.
 });
 test('导出的操作日志标注实际使用的筛选条件，与界面显示一致', () => {

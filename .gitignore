@@ -32,3 +32,6 @@ pnpm-debug.log*
 .vscode/
 .DS_Store
 Thumbs.db
+
+.npm-cache/
+.supabase/

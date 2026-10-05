@@ -8,7 +8,7 @@ const NO_AUDIT_FILTERS = { username: '', event: '', ip: '', start: '', end: '' }
 const AUDIT_TEXT_KEYS = ['username', 'event', 'ip'];
 const auditFiltersActive = (filters) => Object.values(filters).some(Boolean);
 
-/** Page through a server-side result set with keyset-stable ordering decided by the server. */
+/** Page through a server-side result set with a fixed insertion boundary and deterministic ordering decided by the server. */
 function Pager({ page, total, pageSize, loading, onPage, onPageSize, unit, sizeLabel, sizes = [10, 20, 50] }) {
   const pages = Math.max(1, Math.ceil(total / pageSize));
   const current = Math.min(page, pages);
@@ -37,7 +37,9 @@ export function MemberDirectory({ identity, busy, revision, onSave }) {
     const timer = setTimeout(async () => {
       const response = await apiRequest('admin_members', { ...filters, page, page_size: pageSize });
       if (!mounted) return;
-      if (response.error) setError(response.error.message); else setResult(response.data);
+      if (response.error) { setError(response.error.message); setResult(null); } else {
+        setResult(response.data);
+      }
       setLoading(false);
     }, filters.query ? 250 : 0);
     return () => { mounted = false; clearTimeout(timer); };
@@ -64,7 +66,7 @@ const objectText = (value) => {
 };
 
 /** The complete log entry: full text, field changes and linked objects, no truncation. */
-function AuditDetailDialog({ row, onClose }) {
+function AuditDetailDialog({ row, scope, onClose }) {
   const changes = row.metadata?.changes || {};
   const objects = objectEntries(row.metadata);
   return <div className="dialog-backdrop" role="presentation" onClick={onClose}>
@@ -81,35 +83,44 @@ function AuditDetailDialog({ row, onClose }) {
       {Object.keys(changes).length > 0 && <><h3>字段变更</h3><ul className="audit-change-list">{Object.entries(changes).map(([field, value]) => <li key={field}>{objectText({ [field]: value })}</li>)}</ul></>}
       {objects.length > 0 ? <><h3>关联对象</h3><dl className="audit-detail-list">{objects.map(([key, value]) => <React.Fragment key={key}><dt>{AUDIT_OBJECT_LABEL[key] || key}</dt><dd className={key.endsWith('_id') ? 'audit-code' : ''}>{objectText(value)}</dd></React.Fragment>)}</dl></>
         : <p className="hint">这条日志没有关联对象。</p>}
-      {!row.metadata || Object.keys(row.metadata).length === 0 ? <p className="hint">当前身份只能查看操作内容；完整 IP、请求来源和关联对象仅超级管理员可见。</p> : null}
+      {scope === 'limited' ? <p className="hint">当前身份只能查看操作内容；完整 IP、请求来源和关联对象仅超级管理员可见。</p> : null}
     </div>
   </div>;
 }
 
 /** Server-side audit log search: filters, time-descending paging and a per-row detail view. */
-export function AuditDirectory({ identity, revision, filters, onFiltersChange, filtersRevision = 0 }) {
+export function AuditDirectory({ identity, revision, filters, onFiltersChange, filtersRevision = 0, onSnapshotChange }) {
   const [page, setPage] = useState(1); const [pageSize, setPageSize] = useState(20);
   const [result, setResult] = useState(null); const [loading, setLoading] = useState(true); const [error, setError] = useState('');
   const [detailed, setDetailed] = useState(null);
+  const [refresh, setRefresh] = useState(0);
+  const snapshotRef = useRef({ key: '', snapshot: null });
+  const superAdmin = identity.profile.username?.toLowerCase() === 'admin';
   const textFilter = AUDIT_TEXT_KEYS.some((key) => filters[key]);
   useEffect(() => {
-    let mounted = true; setLoading(true); setError('');
+    let mounted = true; setLoading(true); setError(''); setDetailed(null);
+    const key = JSON.stringify([filters, filtersRevision, refresh]);
+    if (snapshotRef.current.key !== key) snapshotRef.current = { key, snapshot: null };
     const timer = setTimeout(async () => {
-      const response = await apiRequest('admin_audit', { ...filters, page, page_size: pageSize });
+      const response = await apiRequest('admin_audit', { ...filters, page, page_size: pageSize, snapshot: snapshotRef.current.snapshot });
       if (!mounted) return;
-      if (response.error) setError(response.error.message); else setResult(response.data);
+      if (response.error) { setError(response.error.message); setResult(null); } else {
+        snapshotRef.current.snapshot = response.data.snapshot;
+        onSnapshotChange(response.data.snapshot);
+        setResult(response.data);
+      }
       setLoading(false);
     }, textFilter ? 250 : 0);
     return () => { mounted = false; clearTimeout(timer); };
-  }, [filters.username, filters.event, filters.ip, filters.start, filters.end, page, pageSize, revision, filtersRevision]);
+  }, [filters.username, filters.event, filters.ip, filters.start, filters.end, page, pageSize, revision, filtersRevision, refresh]);
   const change = (key, value) => { onFiltersChange({ ...filters, [key]: value }); setPage(1); };
   const rows = result?.logs || [];
   return <section className="panel detail-panel admin-section audit-directory">
-    <div className="heading-row"><h2>操作日志</h2><span className="muted">{result ? `${result.total} 条记录${result.scope === 'limited' ? ' · 当前身份仅可查看操作内容' : ''}` : ''}</span></div>
+    <div className="heading-row"><h2>操作日志</h2><Button kind="quiet" type="button" onClick={() => { snapshotRef.current = { key: '', snapshot: null }; setPage(1); onSnapshotChange(null); setRefresh((value) => value + 1); }}>刷新日志</Button><span className="muted">{result ? `${result.total} 条记录${result.scope === 'limited' ? ' · 当前身份仅可查看操作内容' : ''}` : ''}</span></div>
     <div className="toolbar audit-toolbar">
       <input type="search" aria-label="搜索用户名" placeholder="用户名" value={filters.username} maxLength="80" onChange={(e) => change('username', e.target.value)} />
       <input type="search" aria-label="搜索操作名称" placeholder="操作名称" value={filters.event} maxLength="80" onChange={(e) => change('event', e.target.value)} />
-      <input type="search" aria-label="搜索 IP 地址" placeholder="IP 地址" value={filters.ip} maxLength="64" onChange={(e) => change('ip', e.target.value)} />
+      {superAdmin && <input type="search" aria-label="搜索 IP 地址" placeholder="IP 地址" value={filters.ip} maxLength="64" onChange={(e) => change('ip', e.target.value)} />}
       <label className="audit-date">开始日期<input type="date" value={filters.start} onChange={(e) => change('start', e.target.value)} /></label>
       <label className="audit-date">结束日期<input type="date" value={filters.end} onChange={(e) => change('end', e.target.value)} /></label>
       {auditFiltersActive(filters) && <Button kind="quiet" type="button" onClick={() => { onFiltersChange({ ...NO_AUDIT_FILTERS }); setPage(1); }}>重置</Button>}
@@ -117,8 +128,8 @@ export function AuditDirectory({ identity, revision, filters, onFiltersChange, f
     <div aria-busy={loading}>{loading ? <div className="panel-empty">加载中…</div> : rows.length ? <div className="table-scroll audit-table"><table><thead><tr><th>时间</th><th>用户名</th><th>IP 地址</th><th>操作</th><th>具体内容</th><th><span className="sr-only">详情</span></th></tr></thead>
       <tbody>{rows.map((row) => <tr key={row.id}><td className="audit-time">{formatDateTime(row.created_at)}</td><td>@{row.username}</td><td className="audit-ip">{row.ip_address || '未记录'}</td><td>{row.event}</td><td className="audit-detail">{auditDetail(row) || '—'}</td><td><Button kind="quiet" type="button" onClick={() => setDetailed(row)}>查看</Button></td></tr>)}</tbody></table></div>
       : <div className="panel-empty">没有符合条件的日志</div>}</div>
-    <Pager page={page} total={result?.total || 0} pageSize={pageSize} loading={loading} onPage={setPage} onPageSize={(size) => { setPageSize(size); setPage(1); }} unit="条" sizeLabel="每页日志数" sizes={[10, 20, 50, 100]} />
-    {detailed && <AuditDetailDialog row={detailed} onClose={() => setDetailed(null)} />}
+    <Pager page={result?.page || page} total={result?.total || 0} pageSize={pageSize} loading={loading} onPage={setPage} onPageSize={(size) => { setPageSize(size); setPage(1); }} unit="条" sizeLabel="每页日志数" sizes={[10, 20, 50, 100]} />
+    {detailed && <AuditDetailDialog row={detailed} scope={result?.scope} onClose={() => setDetailed(null)} />}
   </section>;
 }
 
@@ -128,6 +139,9 @@ export function AdminPanel({ identity }) {
   const [auditFilters, setAuditFilters] = useState({ ...NO_AUDIT_FILTERS });
   // The audit export and the audit list read the same filter object, so they can never disagree.
   const [auditFiltersRevision, setAuditFiltersRevision] = useState(0);
+  const [auditSnapshot, setAuditSnapshot] = useState(null);
+  const changeAuditFilters = (next) => { setAuditFilters(next); setAuditSnapshot(null); };
+  const refreshAudit = () => { setAuditSnapshot(null); setAuditFiltersRevision((value) => value + 1); };
   const [period, setPeriod] = useState({ start: '', end: '', opening: '' }); const [error, setError] = useState(''); const [notice, setNotice] = useState(''); const [busy, setBusy] = useState(false); const lock = useRef(false);
   const load = async () => {
     const result = await apiRequest('admin_data'); if (result.error) throw new Error(result.error.message);
@@ -145,13 +159,13 @@ export function AdminPanel({ identity }) {
     if (period.opening !== '' && (!Number.isFinite(Number(period.opening)) || Math.abs(Number(period.opening)) > 1e12)) throw new Error('请输入有效的期初余额。');
   };
   const exportReport = (kind) => run(async () => {
-    validPeriod();
-    const result = await request(kind === 'financial' ? 'export_financial' : 'export_audit', kind === 'financial' ? { start: period.start, end: period.end } : { ...auditFilters });
+    if (kind === 'financial') validPeriod();
+    const result = await request(kind === 'financial' ? 'export_financial' : 'export_audit', kind === 'financial' ? { start: period.start, end: period.end } : { ...auditFilters, snapshot: auditSnapshot });
     await downloadExport(kind, result, period.opening);
   }, '文件已生成，下载已开始。');
   // Plain date-range export, kept for the period-based report work in the same panel.
   const exportPeriodAudit = () => run(async () => {
-    validPeriod();
+    if (period.start && period.end && period.start > period.end) throw new Error('结束日期不能早于开始日期。');
     await downloadExport('audit', await request('export_audit', { start: period.start, end: period.end }));
   }, '文件已生成，下载已开始。');
   if (!identity.roles.includes('admin')) return <div className="panel-empty"><h2>没有权限</h2></div>;
@@ -167,11 +181,11 @@ export function AdminPanel({ identity }) {
           <div className="role-choices">{Object.entries(ROLE_LABEL).map(([role, label]) => <label className="check-row" key={role}><input type="checkbox" checked={newUser.roles.includes(role)} onChange={(e) => setNewUser({ ...newUser, roles: e.target.checked ? [...newUser.roles, role] : newUser.roles.filter((r) => r !== role) })} />{label}</label>)}</div><p className="hint">不选择角色时，为普通用户。</p><Button>添加用户</Button>
         </fieldset></form></section>
         <section className="panel detail-panel"><h2>数据导出</h2><fieldset disabled={busy}><div className="form-grid"><label>开始日期<input type="date" value={period.start} onChange={(e) => setPeriod({ ...period, start: e.target.value })} /></label><label>结束日期<input type="date" value={period.end} onChange={(e) => setPeriod({ ...period, end: e.target.value })} /></label></div><label>期初余额（元，可不填）<input type="number" step="0.01" value={period.opening} onChange={(e) => setPeriod({ ...period, opening: e.target.value })} /></label><p className="hint">财报仅含已付款报销。不填写期初余额时，收入及余额留空。</p><div className="export-actions"><Button type="button" onClick={() => exportReport('financial')}>导出财报</Button><Button type="button" kind="secondary" onClick={() => exportPeriodAudit()}>按日期导出操作日志</Button></div></fieldset>
-          <div className="audit-export-row"><p className="hint">按上面的「操作日志」筛选条件导出：{auditFiltersActive(auditFilters) ? auditFilterSummary(auditFilters) : '全部分类、全部时间'}</p><div className="export-actions"><Button type="button" kind="secondary" onClick={() => exportReport('audit')}>导出筛选后的操作日志</Button><Button type="button" kind="quiet" onClick={() => { setAuditFilters({ ...NO_AUDIT_FILTERS }); setAuditFiltersRevision((value) => value + 1); }}>清空筛选</Button></div></div>
+          <div className="audit-export-row"><p className="hint">按上面的「操作日志」筛选条件导出：{auditFiltersActive(auditFilters) ? auditFilterSummary(auditFilters) : '全部分类、全部时间'}</p><div className="export-actions"><Button type="button" kind="secondary" disabled={busy || auditSnapshot === null} onClick={() => exportReport('audit')}>导出筛选后的操作日志</Button><Button type="button" kind="quiet" onClick={() => { changeAuditFilters({ ...NO_AUDIT_FILTERS }); refreshAudit(); }}>清空筛选</Button></div></div>
         </section>
       </div>
       <MemberDirectory identity={identity} busy={busy} revision={data} onSave={(user_id, roles, active) => run(() => request('set_member_roles', { user_id, roles, active }), '用户设置已保存。')} />
-      <AuditDirectory identity={identity} revision={data} filters={auditFilters} onFiltersChange={setAuditFilters} filtersRevision={auditFiltersRevision} />
+      <AuditDirectory identity={identity} revision={data} filters={auditFilters} onFiltersChange={changeAuditFilters} filtersRevision={auditFiltersRevision} onSnapshotChange={setAuditSnapshot} />
     </>}
   </>;
 }

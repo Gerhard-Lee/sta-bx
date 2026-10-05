@@ -1,73 +1,91 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { auditFilterSummary } from '../src/reporting.js';
+import { transform } from 'esbuild';
 
-const jsx = readFileSync('src/admin.jsx', 'utf8');
-const api = readFileSync('supabase/functions/app-api/index.ts', 'utf8');
-const sql = readFileSync('supabase/audit-search-and-pagination.sql', 'utf8');
-
-test('操作日志按用户名、操作名称、IP 和日期范围筛选，并只返回符合条件的记录', () => {
-  for (const label of ['搜索用户名', '搜索操作名称', '搜索 IP 地址', '开始日期', '结束日期', '重置']) assert.ok(jsx.includes(label), `缺少筛选控件 ${label}`);
-  assert.match(jsx, /apiRequest\('admin_audit', \{ \.\.\.filters, page, page_size: pageSize \}\)/);
-  assert.match(api, /action === 'admin_audit'[\s\S]{0,80}requireRole\(actor, 'admin'\)/);
-  // Every entered condition reaches the query; nothing is dropped or ignored.
-  for (const key of ['username', 'event', 'ip', 'start', 'end']) assert.ok(sql.includes(`p_${key}`), `筛选条件 ${key} 未参与查询`);
-  assert.match(sql, /p_username='' or strpos\(lower\(coalesce\(l\.username,''\)\),lower\(trim\(p_username\)\)\)>0/);
-  assert.match(sql, /p_event='' or strpos\(lower\(l\.event\),lower\(trim\(p_event\)\)\)>0/);
-  assert.match(sql, /p_ip='' or coalesce\(l\.ip_address,''\) ilike/);
-  assert.match(sql, /start_at is null or l\.created_at>=start_at/);
-  assert.match(sql, /end_at is null or l\.created_at<end_at/);
+// Execute the actual Edge handler; only the Supabase transport and Deno host are mocked.
+const source = readFileSync('supabase/functions/app-api/index.ts', 'utf8');
+const transformed = source.replace(/import \{ createClient \} from '[^']+'\n/, 'const createClient = globalThis.__auditClient;\n');
+let handler, actorRoles = ['admin'], queries, rpcCalls, rpcResult;
+globalThis.Deno = { env: { get: () => '' }, serve: (fn) => { handler = fn; } };
+globalThis.__auditClient = () => ({
+  from(table) {
+    queries.push(table);
+    const data = table === 'app_sessions' ? { user_id: 'actor', expires_at: '2099-01-01' }
+      : table === 'app_users' ? { id: 'actor', username: 'manager', active: true }
+      : table === 'user_roles' ? actorRoles.map(role => ({role}))
+      : table === 'settings' ? { threshold: 100, registration_enabled: true } : null;
+    const query = { then(resolve, reject) { return Promise.resolve({data, error:null}).then(resolve, reject); } };
+    for (const method of ['select', 'eq', 'maybeSingle', 'single', 'update', 'insert', 'delete', 'order', 'range']) query[method] = () => query;
+    return query;
+  },
+  async rpc(name, args) { rpcCalls.push({name, args}); return rpcResult(name, args); },
 });
+const { code } = await transform(transformed, { loader: 'ts', format: 'esm' });
+const { readAuditFilters } = await import('data:text/javascript;base64,' + Buffer.from(code).toString('base64'));
+const limitedRow = {id: 1, username:'legacy', event:'登录账号', detail:'操作', ip_address:null, metadata:{}, request_id:null};
+function reset() {
+  queries = []; rpcCalls = []; actorRoles = ['admin'];
+  rpcResult = () => ({data: {logs:[limitedRow], total:1, page:1, snapshot:'9007199254740993', scope:'limited'}, error:null});
+}
+async function request(body) {
+  const response = await handler(new Request('https://test.invalid', { method:'POST', headers:{'content-type':'application/json','x-app-session':'test-session'}, body:JSON.stringify(body) }));
+  return {status:response.status, ...(await response.json())};
+}
 
-test('服务端分页且按时间倒序，日志不再一次性全部加载到浏览器', () => {
-  assert.ok(!jsx.includes('data.audit.map'));
-  assert.doesNotMatch(jsx, /最近 50 条/);
-  // Ordering is time plus the unique id, so a page boundary can never repeat or skip a row.
-  assert.match(sql, /order by l\.created_at desc,l\.id desc/);
-  assert.match(sql, /limit p_page_size offset \(current_page-1\)\*p_page_size/);
-  assert.match(sql, /current_page := least\(p_page,greatest\(1,\(total\+p_page_size-1\)\/p_page_size\)\)/);
-  assert.match(sql, /create index if not exists audit_logs_created_id_idx on public\.audit_logs\(created_at desc, id desc\)/);
-  assert.match(sql, /p_page_size is null or p_page_size not in \(10,20,50,100\)/);
-  for (const label of ['每页日志数', '上一页', '下一页']) assert.ok(jsx.includes(label), `缺少分页控件 ${label}`);
+test('筛选日期、长度和分页参数实际校验，快照 bigint 不损失精度', () => {
+  assert.equal(readAuditFilters({snapshot:'9007199254740993'}, true).snapshot, '9007199254740993');
+  for (const body of [{start:'2026-02-30'}, {start:'2026-10-02',end:'2026-10-01'}, {username:'x'.repeat(81)}, {page_size:7}, {snapshot:'9223372036854775808'}, {snapshot:'-1'}]) assert.throws(() => readAuditFilters(body, true));
 });
-
-test('日志列表与操作日志导出共用同一套筛选条件', () => {
-  // One filter definition, two consumers: the paged table and the export.
-  assert.match(api, /readAuditFilters\(body, true\)/);
-  assert.match(api, /readAuditFilters\(body, false\)/);
-  assert.match(api, /const auditExport = action === 'export_audit'/);
-  assert.ok(api.includes('if (auditExport) query = applyAuditFilters(query, filters, actorIds)'), '导出没有复用同一套筛选条件');
-  assert.match(jsx, /kind === 'financial' \? \{ start: period\.start, end: period\.end \} : \{ \.\.\.auditFilters \}/);
-  // The export keeps its Beijing-day boundaries identical to the list.
-  assert.match(api, /filters\.start \+ 'T00:00:00\+08:00'/);
-  assert.match(sql, /\(p_start\|\|' 00:00:00\+08'\)::timestamptz/);
-  assert.match(sql, /interval '1 day'/);
+test('日志列表将全部筛选和快照交给共享 RPC', async () => {
+  reset();
+  const result = await request({action:'admin_audit', username:'legacy',event:'登录',ip:'',start:'2026-10-01',end:'2026-10-05',page:2,page_size:10,snapshot:'9007199254740993'});
+  assert.equal(result.status,200);
+  assert.deepEqual(rpcCalls[0], {name:'app_list_audit_logs', args:{p_actor_id:'actor',p_username:'legacy',p_event:'登录',p_ip:'',p_start:'2026-10-01',p_end:'2026-10-05',p_page:2,p_page_size:10,p_snapshot:'9007199254740993'}});
+  assert.ok(!queries.includes('audit_logs'));
 });
-
-test('普通管理员只看到允许查看的内容，超级管理员看到完整记录和关联对象', () => {
-  assert.match(sql, /super_admin := private\.app_user_is_superadmin\(p_actor_id\)/);
-  assert.match(sql, /when super_admin\s*\n\s*then to_jsonb\(l\)/);
-  // The limited projection keeps the action text but withholds IP and request metadata.
-  assert.match(sql, /'ip_address',null/);
-  assert.match(sql, /'metadata','\{\}'::jsonb/);
-  assert.match(sql, /'scope',case when super_admin then 'full' else 'limited' end/);
-  assert.match(jsx, /result\.scope === 'limited' \? ' · 当前身份仅可查看操作内容' : ''/);
-  assert.match(jsx, /仅超级管理员可见/);
+test('兼容 admin_data 通过共享投影返回日志，不能绕过权限', async () => {
+  reset();
+  const result = await request({action:'admin_data'});
+  assert.deepEqual(result.data.audit,[limitedRow]);
+  assert.equal(result.data.scope,'limited');
+  assert.ok(!queries.includes('audit_logs'));
 });
-
-test('可以查看单条日志的完整内容和关联对象', () => {
-  assert.match(jsx, /function AuditDetailDialog/);
-  for (const label of ['日志详情', '具体内容', '关联对象', '字段变更', '查看']) assert.ok(jsx.includes(label), `详情视图缺少 ${label}`);
-  assert.match(jsx, /onClick=\{\(\) => setDetailed\(row\)\}/);
-  assert.match(jsx, /<dt>编号<\/dt><dd className="audit-code">\{String\(row\.id\)\}<\/dd>/);
+test('导出与列表共用 RPC 和固定快照，保留普通管理员受限投影', async () => {
+  reset();
+  rpcResult = (name,args) => ({data:{logs:args.p_page === 1 ? Array(1000).fill(limitedRow) : [{...limitedRow,id:1001}],total:1001,snapshot:'9007199254740993',scope:'limited'}, error:null});
+  const result = await request({action:'export_audit',username:'legacy',event:'登录',start:'2026-10-01'});
+  assert.equal(result.data.rows.length,1001);
+  assert.equal(rpcCalls.length,2);
+  assert.equal(rpcCalls[0].args.p_snapshot,null);
+  assert.equal(rpcCalls[1].args.p_snapshot,'9007199254740993');
+  assert.equal(rpcCalls[1].args.p_username,'legacy');
+  assert.equal(result.data.scope,'limited');
+  assert.ok(result.data.rows.every(row => row.ip_address === null && !Object.keys(row.metadata).length));
+  assert.equal(queries.filter(table => table === 'audit_logs').length,1); // export audit INSERT only
 });
-
-test('筛选条件由界面到导出保持一致，日期范围校验不放松', () => {
-  assert.match(jsx, /auditFiltersActive\(auditFilters\) \? auditFilterSummary\(auditFilters\) : '全部分类、全部时间'/);
-  assert.equal(auditFilterSummary({ username: 'admin', start: '2026-10-01', end: '2026-10-31' }), '用户名 含「admin」 · 2026-10-01 至 2026-10-31');
-  assert.match(api, /请选择有效的日期范围。|有效的日期范围/);
-  assert.match(sql, /raise exception '搜索或分页参数无效'/);
-  assert.match(sql, /length\(p_username\)>80/);
-  assert.match(sql, /length\(p_ip\)>64/);
+test('数据库拒绝的 IP 筛选也会阻止 API 导出', async () => {
+  reset();
+  rpcResult = () => ({data:null,error:{message:'仅超级管理员可以按 IP 筛选'}});
+  const result = await request({action:'export_audit',ip:'10.0.'});
+  assert.equal(result.status,400);
+  assert.equal(result.error.message,'仅超级管理员可以按 IP 筛选');
+  assert.ok(!queries.includes('audit_logs'));
+});
+test('非管理员不能访问新列表、兼容列表或导出', async () => {
+  for (const action of ['admin_audit','admin_data','export_audit']) {
+    reset(); actorRoles = [];
+    assert.equal((await request({action})).status,403);
+    assert.equal(rpcCalls.length,0);
+  }
+});
+test('SQL 仅服务端可执行，界面隐藏普通管理员 IP 搜索并复用快照', () => {
+  const sql = readFileSync('supabase/audit-search-and-pagination.sql','utf8');
+  const jsx = readFileSync('src/admin.jsx','utf8');
+  assert.match(sql,/from public,anon,authenticated/);
+  assert.match(sql,/to service_role/);
+  assert.match(jsx,/\{superAdmin && <input type="search" aria-label="搜索 IP 地址"/);
+  assert.match(jsx,/snapshot: snapshotRef.current.snapshot/);
+  assert.match(jsx,/snapshot: auditSnapshot/);
+  assert.match(jsx,/setResult\(null\)/); // invalid filters must not display stale rows
 });
