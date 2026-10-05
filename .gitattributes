@@ -1,0 +1,10 @@
+# 部署脚本要在 Linux 上直接执行：必须是 LF，不能被 Windows 的 core.autocrlf 转成 CRLF
+# （带 \r 的 drain.sh 会报 /bin/sh^M，cron.d 文件里的命令会带上不可见的回车）。
+*.sh text eol=lf
+*.cron text eol=lf
+Dockerfile text eol=lf
+*.env.example text eol=lf
+# 部署用的 compose/YAML 也固定 LF：Windows 上 core.autocrlf 会把工作区副本转成 CRLF，
+# 让按行解析 YAML 的测试在 Windows 本机失败（CI 与 Linux 上看不出来）。
+*.yml text eol=lf
+*.yaml text eol=lf
