@@ -11,7 +11,6 @@ const cronVerify = source('supabase/migrations/20261005140000_email_notify_cron.
 const api = source('supabase/functions/app-api/index.ts');
 const main = source('src/main.jsx');
 const admin = source('src/admin.jsx');
-const readme = source('README.md');
 const EMAIL_CORE = '[a-z0-9._%+-]+@[a-z0-9.-]+\\.[a-z]{2,}$';
 const slice = (text, from, to) => {
   const start = text.indexOf(from);
@@ -451,7 +450,6 @@ test('密钥只从 Edge Function 环境读取，配置值不进前端、仓库�
   assert.match(api, /Deno\.env\.get\('EMAIL_FROM'\)/);
   assert.equal(api.includes('console.log(apiKey'), false);
   assert.equal(api.includes('console.log(cronSecret'), false);
-  assert.equal(readme.includes('sb_secret'), false);
   assert.equal(cron.includes('Bearer '), false, '定时调度 SQL 不得内嵌任何真实密钥');
 });
 test('定时消费用 pg_cron，缺扩展或未配置时只提示不阻塞，且不写死项目地址', () => {
@@ -473,7 +471,6 @@ test('定时消费用 pg_cron，缺扩展或未配置时只提示不阻塞，且
   for (const text of [verify, cronVerify]) {
     assert.equal(/raise\s+(exception|notice)\s+'[^']*'\s*\|\|/.test(text), false, 'RAISE 必须用 % 占位符，不能拼字符串');
   }
-  assert.match(readme, /app_register_email_cron/);
 });
 test('迁移先检查散装 SQL 的前置依赖，避免运行期才报函数不存在', () => {
   assert.match(migration, /if to_regprocedure\('private\.app_insert_user\(text,text,text,text\)'\) is null then/);
@@ -481,7 +478,6 @@ test('迁移先检查散装 SQL 的前置依赖，避免运行期才报函数不
   // 建号分配角色与身份判定同样在运行期才会用到，缺了也要在迁移时就报出来。
   assert.match(migration, /if to_regprocedure\('public\.app_set_member_roles\(uuid,uuid,text\[\],boolean\)'\) is null then/);
   assert.match(migration, /if to_regprocedure\('private\.app_user_has_role\(uuid,text\)'\) is null then/);
-  assert.match(readme, /supabase\/admin-settings-audit\.sql/);
 });
 test('状态中文标签在 app-api 与前端两份拷贝之间逐项一致', () => {
   // 这两份是各自独立的拷贝（Edge Function 不能引用前端模块、前端也不引用函数），没有任何运行期约束，
@@ -576,7 +572,4 @@ test('迁移行为验证真的驱动状态变化，而不是只看对象是否�
   assert.match(verify, /intersect\s+select unnest\(claim_1_ids\)/);
   assert.equal(/claim_id = claim_1 and id in \(\s*select \(element->>'id'\)::bigint from jsonb_array_elements/.test(verify), false, '不允许再写恒真的双批次断言');
   assert.equal(/\binsert into public\.notifications\b/.test(verify), false, '队列记录必须由触发器产生，验证不能自己插行');
-});
-test('README 说明密钥、执行顺序与两种消费入口', () => {
-  for (const needed of ['EMAIL_API_URL', 'EMAIL_API_KEY', 'EMAIL_FROM', 'CRON_SECRET', 'app_register_email_cron', 'send_notifications', 'supabase/admin-settings-audit.sql', 'x-app-cron', 'NOTIFY_MAX_RUNTIME_MS']) assert.ok(readme.includes(needed), `README 缺少：${needed}`);
 });

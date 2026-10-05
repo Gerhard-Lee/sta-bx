@@ -13,7 +13,6 @@ const drain = source('deploy/drain.sh');
 const drainEnv = source('deploy/drain.env.example');
 const cron = source('deploy/stabx-notify.cron');
 const check = source('deploy/check.sh');
-const guide = source('deploy/README.md');
 const api = source('supabase/functions/app-api/index.ts');
 
 test('中继的接口形状与 app-api 的发送请求完全一致', () => {
@@ -98,7 +97,6 @@ test('curl 超时必须大于函数一轮的消费预算，否则客户端先断
   const budgetSeconds = NOTIFY_QUEUE.maxRuntimeMs / 1000;
   assert.ok(seconds(drain, /STABX_NOTIFY_TIMEOUT:-(\d+)/) > budgetSeconds, 'drain.sh 的默认超时必须大于 NOTIFY_MAX_RUNTIME_MS');
   assert.ok(seconds(drainEnv, /STABX_NOTIFY_TIMEOUT="?(\d+)"?/) > budgetSeconds, '模板里的超时必须大于 NOTIFY_MAX_RUNTIME_MS');
-  assert.match(source('deploy/README.md'), /必须\*\*大于\*\*函数侧一轮消费的预算/);
   // 托管免费方案的墙钟与 idle timeout 都是 150 秒：默认预算必须留在其内，自托管覆盖也不能超过 curl 超时。
   assert.ok(NOTIFY_QUEUE.maxRuntimeMs < 150000, '默认预算必须在免费方案 150 秒墙钟之内');
   const composeBudget = seconds(override, /NOTIFY_MAX_RUNTIME_MS:-(\d+)/);
@@ -118,13 +116,6 @@ test('自检脚本覆盖六层，且失败会让退出码非 0', () => {
   assert.match(check, /exit "\$fail"/);
   assert.match(check, /已绑定邮箱人数/);
 });
-test('部署说明给出三种摆法与“备案只关乎对外网站”的结论', () => {
-  for (const needed of ['云 Supabase + HTTP 邮件 API', '全栈自托管 + QQ 授权码', '云 Supabase + QQ 授权码', '备案', 'Docker Compose **≥ 2.24**', 'pg_dump', 'smtpdm.aliyun.com']) assert.ok(guide.includes(needed), `部署说明缺少：${needed}`);
-  // 口径必须准确：官方限制只禁 25/587，465 可用但不被承诺——中继是工程取舍，不是物理不可能。
-  // 详细依据（官方 Limits 链接、社区实测）在 deployment.md，deploy/README 只留结论。
-  assert.match(guide, /465[^\n]*未承诺/);
-  assert.ok(source('docs/deployment.md').includes('`25`/`587`'), 'deployment.md 必须写明官方出站限制只列 25/587');
-});
 test('部署脚本与 compose 必须是 LF：Windows 上 checkout 后拷到 Linux 执行不能被回车符破坏', () => {
   const attributes = source('.gitattributes');
   for (const rule of ['*.sh text eol=lf', '*.cron text eol=lf', 'Dockerfile text eol=lf', '*.yml text eol=lf', '*.yaml text eol=lf']) assert.ok(attributes.includes(rule), `.gitattributes 缺少 ${rule}`);
@@ -138,7 +129,6 @@ test('构建缺 VITE_* 时 fail-fast，而不是悄悄产出只显示错误壳�
   assert.match(config, /loadEnv\(mode, process\.cwd\(\), 'VITE_'\)/);
   assert.match(config, /process\.env\[key\]/, '云端（Vercel/CF）的环境变量来自 process.env，必须一起读');
   assert.match(config, /throw new Error\(/, '缺变量必须让构建失败');
-  assert.match(source('README.md'), /连接暂不可用/);
 });
 
 test('app-api 两处自托管加固：空密钥回落与签名地址换 host', () => {

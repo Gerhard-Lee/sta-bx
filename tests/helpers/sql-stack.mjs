@@ -97,7 +97,7 @@ const MIGRATION_FILES = (() => {
     .map((name) => path.join(directory, name));
 })();
 
-// docs/database-migrations.md 的 4 份散装 SQL：早期在 Supabase Dashboard 的 SQL 编辑器里手工执行过。
+// 4 份散装 SQL：早期在 Supabase Dashboard 的 SQL 编辑器里手工执行过。
 const BULK_FILES = [
   path.join(SQL_ROOT, 'admin-settings-audit.sql'),
   path.join(SQL_ROOT, 'member-management-and-resubmission.sql'),

@@ -1,7 +1,7 @@
 // 用真实 PostgreSQL（PGlite，WASM）把仓库的整套 SQL 栈真的执行一遍。
 // 现有测试大多只做源码字符串断言，证明了"SQL 长什么样"，证明不了"SQL 能跑"：
 // 20261004210000_email_notify.sql 里 name[] = text[] 那条路径就是在真实解析时才暴露的。
-// 本文件按 docs/database-migrations.md 的执行顺序逐文件执行，失败时把文件路径与原始报错一起抛出。
+// 本文件按固定的执行顺序逐文件执行，失败时把文件路径与原始报错一起抛出。
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync, readdirSync, existsSync } from 'node:fs';
@@ -92,7 +92,7 @@ const MIGRATION_FILES = (() => {
   return names.map((name) => path.join(directory, name));
 })();
 
-// docs/database-migrations.md「执行顺序」里的 4 份散装 SQL：早期在 Supabase Dashboard 的 SQL 编辑器里
+// 执行顺序里的 4 份散装 SQL：早期在 Supabase Dashboard 的 SQL 编辑器里
 // 手工执行过、后来才补 verify 的历史遗留。它们全是 alter table / 建函数，针对的都是**已经存在**的表。
 const BULK_FILES = [
   path.join(SQL_ROOT, 'admin-settings-audit.sql'),
