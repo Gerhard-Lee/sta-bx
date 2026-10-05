@@ -127,6 +127,71 @@ function requiredString(value: unknown, message: string) {
   return text
 }
 
+const AUDIT_PAGE_SIZES = [10, 20, 50, 100]
+const AUDIT_TEXT_LIMITS: Record<string, number> = { username: 80, event: 80, ip: 64 }
+const BEIJING_DAY = /^\d{4}-\d{2}-\d{2}$/
+
+/**
+ * The single definition of what an audit-log filter means. The paged table and the
+ * export both read it, so the export can never disagree with what the operator saw.
+ */
+export function readAuditFilters(body: Record<string, unknown>, withPage: boolean) {
+  const filters: Record<string, string> = {}
+  for (const [key, limit] of Object.entries(AUDIT_TEXT_LIMITS)) {
+    const value = String(body[key] ?? '').trim()
+    if (value.length > limit) throw new HttpError('搜索条件过长。')
+    filters[key] = value
+  }
+  const validDay = (value: string) => BEIJING_DAY.test(value) && Number.isFinite(Date.parse(value)) && new Date(value).toISOString().slice(0, 10) === value
+  const start = String(body.start ?? '').trim(), end = String(body.end ?? '').trim()
+  if ((start && !validDay(start)) || (end && !validDay(end)) || (start && end && start > end)) throw new HttpError('请选择有效的日期范围。')
+  filters.start = start
+  filters.end = end
+  if (!withPage) return { filters, page: 1, pageSize: 0 }
+  const rawPage = body.page === undefined || body.page === '' ? 1 : Number(body.page)
+  const rawPageSize = body.page_size === undefined || body.page_size === '' ? 20 : Number(body.page_size)
+  if (!Number.isInteger(rawPage) || rawPage < 1 || !AUDIT_PAGE_SIZES.includes(rawPageSize)) throw new HttpError('分页参数无效。')
+  return { filters, page: rawPage, pageSize: rawPageSize }
+}
+
+/** The same predicate the RPC applies, so an export selects exactly the filtered rows. */
+export function applyAuditFilters<T extends { ilike: Function; or: Function; gte: Function; lt: Function }>(
+  query: T, filters: Record<string, string>, actorIds: string[],
+): T {
+  const escape = (value: string) => value.replace(/[%_\\]/g, '\\$&')
+  let next = query
+  if (filters.username) {
+    // audit_logs.username is filled on write; the actor fallback keeps rows written
+    // before that column existed searchable. Both branches are escaped values only.
+    next = actorIds.length
+      ? next.or(`username.ilike.%${escape(filters.username)}%,actor_id.in.(${actorIds.join(',')})`)
+      : next.ilike('username', `%${escape(filters.username)}%`)
+  }
+  if (filters.event) next = next.ilike('event', `%${escape(filters.event)}%`)
+  if (filters.ip) next = next.ilike('ip_address', `%${escape(filters.ip)}%`)
+  if (filters.start) next = next.gte('created_at', filters.start + 'T00:00:00+08:00')
+  if (filters.end) next = next.lt('created_at', new Date(Date.parse(filters.end + 'T00:00:00+08:00') + 86400000).toISOString())
+  return next
+}
+
+/** Operator-facing description of the active filters, reused in the export header row. */
+export function auditFilterSummary(filters: Record<string, string>) {
+  const parts: string[] = []
+  if (filters.username) parts.push(`用户名 含「${filters.username}」`)
+  if (filters.event) parts.push(`操作 含「${filters.event}」`)
+  if (filters.ip) parts.push(`IP 含「${filters.ip}」`)
+  if (filters.start || filters.end) parts.push(`${filters.start || '最早'} 至 ${filters.end || '现在'}`)
+  return parts.join(' · ')
+}
+
+/** Resolve a username filter to actor ids so rows written before the column existed still match. */
+async function auditActorIds(admin: AdminClient, username: string) {
+  if (!username) return []
+  const { data, error } = await admin.from('app_users').select('id').ilike('username', `%${username.replace(/[%_\\]/g, '\\$&')}%`).limit(200)
+  if (error) throw new Error('用户信息读取失败。')
+  return (data ?? []).map((row) => row.id as string)
+}
+
 async function handle(req: Request) {
   if (req.method === 'OPTIONS') return new Response('ok', { headers: corsHeaders })
   if (req.method !== 'POST') throw new HttpError('请求方式不支持。', 405)
@@ -339,6 +404,22 @@ async function handle(req: Request) {
     }))
   }
 
+  // Issue #7: search, filter and page the audit log on the server instead of
+  // shipping every row to the browser.
+  if (action === 'admin_audit') {
+    requireRole(actor, 'admin')
+    const { filters, page, pageSize } = readAuditFilters(body, true)
+    const [paged, events] = await Promise.all([
+      rpc('app_list_audit_logs', {
+        p_actor_id: actor.user.id, p_username: filters.username, p_event: filters.event,
+        p_ip: filters.ip, p_start: filters.start, p_end: filters.end,
+        p_page: page, p_page_size: pageSize,
+      }),
+      rpc('app_audit_log_events', { p_actor_id: actor.user.id }),
+    ])
+    return ok({ ...(paged as Record<string, unknown>), events: Array.isArray(events) ? events : [], filters })
+  }
+
   if (action === 'update_registration') {
     requireRole(actor, 'admin')
     if (typeof body.enabled !== 'boolean') throw new HttpError('请选择是否允许注册。')
@@ -358,15 +439,23 @@ async function handle(req: Request) {
 
   if (action === 'export_financial' || action === 'export_audit') {
     requireRole(actor, 'admin')
-    const start = String(body.start ?? '').trim(), end = String(body.end ?? '').trim()
+    // Issue #7 acceptance: the export reads the same filter object as the log table.
+    const auditExport = action === 'export_audit'
+    const { filters } = readAuditFilters(body, false)
+    const start = auditExport ? filters.start : String(body.start ?? '').trim()
+    const end = auditExport ? filters.end : String(body.end ?? '').trim()
     const validDate = (v: string) => /^\d{4}-\d{2}-\d{2}$/.test(v) && Number.isFinite(Date.parse(v)) && new Date(v).toISOString().slice(0, 10) === v
     if ((start && !validDate(start)) || (end && !validDate(end)) || (start && end && start > end)) throw new HttpError('请选择有效的日期范围。')
     const table = action === 'export_financial' ? 'payments' : 'audit_logs'
+    const actorIds = auditExport ? await auditActorIds(admin, filters.username) : []
     const rows: Record<string, any>[] = []
     for (let offset = 0; ; offset += 1000) {
       let query = admin.from(table).select(action === 'export_financial' ? '*,applications(*)' : '*').order('created_at').order(action === 'export_financial' ? 'application_id' : 'id').range(offset, offset + 999)
-      if (start) query = query.gte('created_at', start + 'T00:00:00+08:00')
-      if (end) query = query.lt('created_at', new Date(Date.parse(end + 'T00:00:00+08:00') + 86400000).toISOString())
+      if (auditExport) query = applyAuditFilters(query, filters, actorIds) as typeof query
+      else {
+        if (start) query = query.gte('created_at', start + 'T00:00:00+08:00')
+        if (end) query = query.lt('created_at', new Date(Date.parse(end + 'T00:00:00+08:00') + 86400000).toISOString())
+      }
       const { data, error } = await query
       if (error) throw new Error('导出数据读取失败。')
       rows.push(...(data ?? []))
@@ -377,8 +466,10 @@ async function handle(req: Request) {
     if (error) throw new Error('用户信息读取失败。')
     const userMap = new Map((users ?? []).map((u) => [u.id, u]))
     const result = rows.map((row) => action === 'export_financial' ? { ...row, applicant: userMap.get(row.applications?.owner_id)?.full_name || '', username: userMap.get(row.applications?.owner_id)?.username || '', operator: userMap.get(row.actor_id)?.username || '' } : { ...row, username: row.username || userMap.get(row.actor_id)?.username || '系统' })
-    await audit(actor.user.id, action === 'export_financial' ? '导出财报' : '导出操作日志', `${start || '全部'} 至 ${end || '现在'} · ${result.length} 条`, { start, end, count: result.length })
-    return ok({ rows: result, start, end, generated_at: new Date().toISOString() })
+    delete filters.actor_ids
+    const scope = auditFilterSummary(filters)
+    await audit(actor.user.id, action === 'export_financial' ? '导出财报' : '导出操作日志', `${start || '全部'} 至 ${end || '现在'}${scope ? ' · ' + scope : ''} · ${result.length} 条`, { start, end, count: result.length, filters: auditExport ? filters : undefined })
+    return ok({ rows: result, start, end, filters, generated_at: new Date().toISOString() })
   }
 
   if (action === 'set_member_roles') {
