@@ -12,6 +12,7 @@ export function validateEmail(value) {
 // 拒绝申请、已付款、已撤回、草稿属于完结或起始态，没有待办，不发邮件。
 export const NOTIFY_EVENTS = ['待财委审批', '待主席审批', '退回修改', '待补充收款码', '待付款登记'];
 // 队列消费参数：与 app-api 顶部的 NOTIFY_* 常量一一对应（Edge Function 不能引用前端模块，两边各自声明），
-// 并且必须落在数据库 app_claim_notifications 允许的取值范围内（单次 1–200 封、租约 30–900 秒、有效期 1–168 小时）。
+// 并且必须落在数据库 app_claim_notifications 允许的取值范围内（单次 1–200 封、租约 30–900 秒、有效期 1–168 小时、
+// 失败上限 1–10；maxAttempts 同时也是该函数的默认值）。
 // maxRuntimeMs 只在前端与函数两侧使用：托管 Edge Functions 的墙钟上限是 150/400 秒，一轮消费到点就收尾。
 export const NOTIFY_QUEUE = { batch: 100, rounds: 8, concurrency: 5, sendTimeoutMs: 15000, leaseSeconds: 300, maxAgeHours: 24, maxAttempts: 5, backoffCapMinutes: 60, maxRuntimeMs: 240000 };

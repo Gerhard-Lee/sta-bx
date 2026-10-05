@@ -59,7 +59,7 @@
 
 ## 12 `20261004210000_email_notify.sql` 被就地改写过
 
-该迁移在**未合并、从未部署**的分支上，因此审查修复时直接改了它三次：第一次新增 `sending` 状态、租约、事件集收窄；第二次新增 `cancelled` 终态、把去重唯一约束换成部分唯一索引、`app_bind_email` 改成三参数；第三次（PR #19 外部评审）修 `array_agg(a.attname)` 的 `name[] = text[]` 解析错误、加 `app_notify_recipient_allowed` 消费前身份复核、把 `app_claim_notifications` 改成五参数（失败上限）并让恢复路径也执行它。每次都保留了对旧结构收敛的 `alter` / `drop ... if exists` / 按函数名删重载的语句，因此对"已经执行过旧版"的库重跑本文件仍然有效。
+该迁移在**未合并、从未部署**的分支上，因此审查修复时直接改了它三次：第一次新增 `sending` 状态、租约、事件集收窄；第二次新增 `cancelled` 终态、把去重唯一约束换成部分唯一索引、`app_bind_email` 改成三参数；第三次（PR #19 外部评审）修 `array_agg(a.attname)` 的 `name[] = text[]` 解析错误、加 `app_notify_recipient_allowed` 消费前身份复核与"版本已过期"作废、把 `app_claim_notifications` 改成五参数（失败上限）并让恢复路径也执行它。每次都保留了对旧结构收敛的 `alter` / `drop ... if exists` / 按函数名删重载的语句，因此对"已经执行过旧版"的库重跑本文件仍然有效。
 **如果有人已经在自己的库上执行过旧版本**：迁移账本与文件内容不一致，需要 `supabase migration repair` 或手工重跑该文件（它是幂等的）。
 
 ## 已修（本轮邮件审查的产出，留此备查）
