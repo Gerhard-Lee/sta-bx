@@ -8,6 +8,7 @@ const superadmin = { profile: { id: 'admin', username: 'admin' }, roles: ['admin
 const admin = { profile: { id: 'ops-admin', username: 'ops-admin' }, roles: ['admin'] };
 const financeAdmin = { profile: { id: 'finance-admin', username: 'finance-admin' }, roles: ['admin', 'finance'] };
 const outsider = { profile: { id: 'other' }, roles: [] };
+const financeMember = { profile: { id: 'fin', username: 'fin' }, roles: ['finance'] };
 const app = (status) => ({ owner_id: 'owner', status });
 
 test('保存后的草稿和退回申请可以继续编辑，其他成员不能编辑', () => {
@@ -19,7 +20,7 @@ test('已提交但未付的申请附件可修正，已付记录不可静默移�
   assert.equal(canEditAttachments(app('paid'), owner), false);
   assert.equal(canEditAttachments(app('draft'), admin), false);
 });
-test('收款码可在付款前更换；普通管理员不代替流程身份，超级管理员可跨身份操作', () => {
+test('收款码可在付款前更换；付款登记由财委身份完成，普通管理员不代替流程身份，超级管理员可跨身份操作', () => {
   assert.equal(canEditPaymentInfo(app('payment_pending'), owner), true);
   assert.equal(canEditPaymentInfo(app('paid'), owner), false);
   assert.equal(isSuperAdmin(superadmin), true);
@@ -27,8 +28,13 @@ test('收款码可在付款前更换；普通管理员不代替流程身份，�
   assert.equal(canRecordPayment(app('payment_pending'), superadmin), true);
   assert.equal(canRecordPayment(app('paid'), superadmin), true);
   assert.equal(canRecordPayment(app('payment_pending'), admin), false);
-  assert.equal(canRecordPayment(app('payment_pending'), financeAdmin), false);
+  assert.equal(canRecordPayment(app('payment_pending'), financeAdmin), true);
+  assert.equal(canRecordPayment(app('payment_pending'), financeMember), true);
+  assert.equal(canRecordPayment(app('paid'), financeMember), true);
+  assert.equal(canRecordPayment(app('finance_pending'), financeMember), false);
   assert.equal(canRecordPayment(app('payment_pending'), owner), false);
+  assert.equal(hasRole(financeMember, 'cashier'), true);
+  assert.equal(hasRole(financeMember, 'chair'), false);
   assert.equal(hasRole(superadmin, 'finance'), true);
   assert.equal(hasRole(admin, 'finance'), false);
   assert.equal(hasRole(financeAdmin, 'finance'), true);
@@ -79,5 +85,16 @@ test('后端只把内置 admin 视为超级管理员', async () => {
   const sql = await readFile(new URL('../supabase/migrations/20261002133000_separate_admin_and_workflow_roles.sql', import.meta.url), 'utf8');
   assert.match(sql, /lower\(u\.username\) = 'admin'/);
   assert.match(sql, /p_role in \('finance', 'chair', 'cashier'\)/);
+  assert.doesNotMatch(sql, /role = p_role or role = 'admin'/);
+});
+
+test('付款登记视同财委：前端、API 与数据库三处判定一致', async () => {
+  const rules = await readFile(new URL('../src/workflow-rules.js', import.meta.url), 'utf8');
+  assert.match(rules, /\(role === 'cashier' && identity\?\.roles\?\.includes\('finance'\) === true\)/);
+  const source = await readFile(new URL('../supabase/functions/app-api/index.ts', import.meta.url), 'utf8');
+  assert.match(source, /\(role === 'cashier' && actor\.roles\.includes\('finance'\)\)/);
+  const sql = await readFile(new URL('../supabase/migrations/20261005010000_finance_can_record_payment.sql', import.meta.url), 'utf8');
+  assert.match(sql, /p_role = 'cashier'\s*\n\s*and exists\([\s\S]{0,140}role = 'finance'/);
+  assert.match(sql, /p_role in \('finance', 'chair', 'cashier'\)\s*\n\s*and private\.app_user_is_superadmin/);
   assert.doesNotMatch(sql, /role = p_role or role = 'admin'/);
 });
