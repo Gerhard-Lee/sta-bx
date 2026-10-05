@@ -220,6 +220,45 @@ function requiredString(value: unknown, message: string) {
   return text
 }
 
+const AUDIT_PAGE_SIZES = [10, 20, 50, 100]
+const AUDIT_TEXT_LIMITS: Record<string, number> = { username: 80, event: 80, ip: 64 }
+const BEIJING_DAY = /^\d{4}-\d{2}-\d{2}$/
+
+/**
+ * The single definition of what an audit-log filter means. The paged table and the
+ * export both read it, so the export can never disagree with what the operator saw.
+ */
+export function readAuditFilters(body: Record<string, unknown>, withPage: boolean) {
+  const filters: Record<string, string> = {}
+  for (const [key, limit] of Object.entries(AUDIT_TEXT_LIMITS)) {
+    const value = String(body[key] ?? '').trim()
+    if (value.length > limit) throw new HttpError('搜索条件过长。')
+    filters[key] = value
+  }
+  const validDay = (value: string) => BEIJING_DAY.test(value) && Number.isFinite(Date.parse(value)) && new Date(value).toISOString().slice(0, 10) === value
+  const start = String(body.start ?? '').trim(), end = String(body.end ?? '').trim()
+  if ((start && !validDay(start)) || (end && !validDay(end)) || (start && end && start > end)) throw new HttpError('请选择有效的日期范围。')
+  filters.start = start
+  filters.end = end
+  const snapshot = body.snapshot == null || body.snapshot === '' ? null : String(body.snapshot)
+  if (snapshot !== null && (!/^\d{1,19}$/.test(snapshot) || BigInt(snapshot) > 9223372036854775807n)) throw new HttpError('日志快照无效。')
+  if (!withPage) return { filters, page: 1, pageSize: 0, snapshot }
+  const rawPage = body.page === undefined || body.page === '' ? 1 : Number(body.page)
+  const rawPageSize = body.page_size === undefined || body.page_size === '' ? 20 : Number(body.page_size)
+  if (!Number.isInteger(rawPage) || rawPage < 1 || !AUDIT_PAGE_SIZES.includes(rawPageSize)) throw new HttpError('分页参数无效。')
+  return { filters, page: rawPage, pageSize: rawPageSize, snapshot }
+}
+
+/** Operator-facing description of the active filters, reused in the export header row. */
+export function auditFilterSummary(filters: Record<string, string>) {
+  const parts: string[] = []
+  if (filters.username) parts.push(`用户名 含「${filters.username}」`)
+  if (filters.event) parts.push(`操作 含「${filters.event}」`)
+  if (filters.ip) parts.push(`IP 含「${filters.ip}」`)
+  if (filters.start || filters.end) parts.push(`${filters.start || '最早'} 至 ${filters.end || '现在'}`)
+  return parts.join(' · ')
+}
+
 async function handle(req: Request) {
   if (req.method === 'OPTIONS') return new Response('ok', { headers: corsHeaders })
   if (req.method !== 'POST') throw new HttpError('请求方式不支持。', 405)
@@ -666,7 +705,7 @@ async function handle(req: Request) {
     const emailServiceReady = Boolean((Deno.env.get('EMAIL_API_URL') ?? '').trim() && (Deno.env.get('EMAIL_API_KEY') ?? '').trim() && (Deno.env.get('EMAIL_FROM') ?? '').trim())
     const [settingResult, auditResult, pendingResult, sendingResult, sentResult, failedResult, cancelledResult] = await Promise.all([
       admin.from('settings').select('threshold,registration_enabled,email_notify_enabled,email_notify_events').eq('id', 1).single(),
-      admin.from('audit_logs').select('*').order('created_at', { ascending: false }).order('id', { ascending: false }).limit(50),
+      rpc('app_list_audit_logs', { p_actor_id: actor.user.id, p_page_size: 50 }),
       admin.from('notifications').select('*', { count: 'exact', head: true }).eq('status', 'pending'),
       admin.from('notifications').select('*', { count: 'exact', head: true }).eq('status', 'sending'),
       admin.from('notifications').select('*', { count: 'exact', head: true }).eq('status', 'sent'),
@@ -675,14 +714,9 @@ async function handle(req: Request) {
     ])
     // 队列统计同样是管理面板的一部分：任何一个查询失败都要报错，不能静默显示 0 封。
     if (settingResult.error || auditResult.error || pendingResult.error || sendingResult.error || sentResult.error || failedResult.error || cancelledResult.error) throw new Error('管理数据读取失败。')
-    const missingNames = [...new Set((auditResult.data ?? []).filter((row) => !row.username && row.actor_id).map((row) => row.actor_id))]
-    const usersResult = missingNames.length ? await admin.from('app_users').select('id,username').in('id', missingNames) : { data: [], error: null }
-    if (usersResult.error) throw new Error('用户信息读取失败。')
-    const names = new Map((usersResult.data ?? []).map((u) => [u.id, u.username]))
-    const logs = (auditResult.data ?? []).map((row) => ({ ...row, username: row.username || names.get(row.actor_id) || '系统' }))
     const failuresResult = await admin.from('notifications')
       .select('id,event,application_id,recipient_user_id,attempts,last_error,created_at')
-      .eq('status', 'failed').order('id', { ascending: false }).limit(5)
+      .eq('status', 'failed').order('id', { ascending: false }).range(0, 4)
     if (failuresResult.error) throw new Error('通知队列读取失败。')
     const failureRows = failuresResult.data ?? []
     const recipientsResult = failureRows.length ? await admin.from('app_users').select('id,username').in('id', [...new Set(failureRows.map((row) => row.recipient_user_id))]) : { data: [], error: null }
@@ -698,7 +732,9 @@ async function handle(req: Request) {
       email_service_configured: emailServiceReady,
       notifications: { pending: pendingResult.count ?? 0, sending: sendingResult.count ?? 0, sent: sentResult.count ?? 0, failed: failedResult.count ?? 0, cancelled: cancelledResult.count ?? 0 },
       failures,
-      audit: logs,
+      // 日志走与列表、导出同一个共享投影：普通管理员只拿到受限字段，权限判定不在 API 里重写一份。
+      audit: auditResult.logs,
+      scope: auditResult.scope,
     })
   }
 
@@ -720,6 +756,22 @@ async function handle(req: Request) {
     return ok(result)
   }
 
+  // Issue #7: search, filter and page the audit log on the server instead of
+  // shipping every row to the browser.
+  if (action === 'admin_audit') {
+    requireRole(actor, 'admin')
+    const { filters, page, pageSize, snapshot } = readAuditFilters(body, true)
+    const [paged, events] = await Promise.all([
+      rpc('app_list_audit_logs', {
+        p_actor_id: actor.user.id, p_username: filters.username, p_event: filters.event,
+        p_ip: filters.ip, p_start: filters.start, p_end: filters.end,
+        p_page: page, p_page_size: pageSize, p_snapshot: snapshot,
+      }),
+      rpc('app_audit_log_events', { p_actor_id: actor.user.id }),
+    ])
+    return ok({ ...(paged as Record<string, unknown>), events: Array.isArray(events) ? events : [], filters })
+  }
+
   if (action === 'update_registration') {
     requireRole(actor, 'admin')
     if (typeof body.enabled !== 'boolean') throw new HttpError('请选择是否允许注册。')
@@ -738,15 +790,34 @@ async function handle(req: Request) {
     return ok(result)
   }
 
-  if (action === 'export_financial' || action === 'export_audit') {
+  if (action === 'export_audit') {
     requireRole(actor, 'admin')
-    const start = String(body.start ?? '').trim(), end = String(body.end ?? '').trim()
-    const validDate = (v: string) => /^\d{4}-\d{2}-\d{2}$/.test(v) && Number.isFinite(Date.parse(v)) && new Date(v).toISOString().slice(0, 10) === v
-    if ((start && !validDate(start)) || (end && !validDate(end)) || (start && end && start > end)) throw new HttpError('请选择有效的日期范围。')
-    const table = action === 'export_financial' ? 'payments' : 'audit_logs'
+    const { filters, snapshot: requestedSnapshot } = readAuditFilters(body, false)
+    const rows: Record<string, unknown>[] = []
+    let snapshot = requestedSnapshot, scope = ''
+    for (let page = 1; ; page++) {
+      const batch = await rpc('app_list_audit_logs', {
+        p_actor_id: actor.user.id, p_username: filters.username, p_event: filters.event,
+        p_ip: filters.ip, p_start: filters.start, p_end: filters.end,
+        p_page: page, p_page_size: 1000, p_snapshot: snapshot,
+      })
+      if (batch.total > 100000) throw new HttpError('数据较多，请缩小筛选范围后导出。')
+      snapshot = batch.snapshot
+      scope = batch.scope
+      rows.push(...batch.logs)
+      if (rows.length >= batch.total) break
+    }
+    await audit(actor.user.id, '导出操作日志', `${auditFilterSummary(filters) || '全部'} · ${rows.length} 条`, { filters, count: rows.length })
+    return ok({ rows, start: filters.start, end: filters.end, filters, snapshot, scope, generated_at: new Date().toISOString() })
+  }
+
+  if (action === 'export_financial') {
+    requireRole(actor, 'admin')
+    const { filters } = readAuditFilters(body, false)
+    const { start, end } = filters
     const rows: Record<string, any>[] = []
     for (let offset = 0; ; offset += 1000) {
-      let query = admin.from(table).select(action === 'export_financial' ? '*,applications(*)' : '*').order('created_at').order(action === 'export_financial' ? 'application_id' : 'id').range(offset, offset + 999)
+      let query = admin.from('payments').select('*,applications(*)').order('created_at').order('application_id').range(offset, offset + 999)
       if (start) query = query.gte('created_at', start + 'T00:00:00+08:00')
       if (end) query = query.lt('created_at', new Date(Date.parse(end + 'T00:00:00+08:00') + 86400000).toISOString())
       const { data, error } = await query
@@ -758,8 +829,8 @@ async function handle(req: Request) {
     const { data: users, error } = await admin.from('app_users').select('id,username,full_name')
     if (error) throw new Error('用户信息读取失败。')
     const userMap = new Map((users ?? []).map((u) => [u.id, u]))
-    const result = rows.map((row) => action === 'export_financial' ? { ...row, applicant: userMap.get(row.applications?.owner_id)?.full_name || '', username: userMap.get(row.applications?.owner_id)?.username || '', operator: userMap.get(row.actor_id)?.username || '' } : { ...row, username: row.username || userMap.get(row.actor_id)?.username || '系统' })
-    await audit(actor.user.id, action === 'export_financial' ? '导出财报' : '导出操作日志', `${start || '全部'} 至 ${end || '现在'} · ${result.length} 条`, { start, end, count: result.length })
+    const result = rows.map((row) => ({ ...row, applicant: userMap.get(row.applications?.owner_id)?.full_name || '', username: userMap.get(row.applications?.owner_id)?.username || '', operator: userMap.get(row.actor_id)?.username || '' }))
+    await audit(actor.user.id, '导出财报', `${start || '全部'} 至 ${end || '现在'} · ${result.length} 条`, { start, end, count: result.length })
     return ok({ rows: result, start, end, generated_at: new Date().toISOString() })
   }
 

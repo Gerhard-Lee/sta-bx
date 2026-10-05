@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { ROLE_LABEL, formatDateTime, auditDetail, financialRows, fillExportTemplate, unpackTemplate } from '../src/reporting.js';
+import { ROLE_LABEL, formatDateTime, auditDetail, auditFilterSummary, financialRows, fillExportTemplate, unpackTemplate } from '../src/reporting.js';
 
 const data = { start: '2026-10-01', end: '2026-10-01', generated_at: '2026-10-01T04:00:01Z', rows: [
   { created_at: '2026-09-30T16:00:01Z', amount: 19.01, reference: '00123', applicant: '小明', applications: { title: '=错误 <& 标题', category: '报销', status: 'paid' } },
@@ -33,7 +33,26 @@ test('日志导出包含完整 IP、用户名、秒级时间、具体内容及�
 });
 test('注册开关、添加用户和导出端点均在后端检查管理员权限', () => {
   const source = readFileSync('supabase/functions/app-api/index.ts','utf8');
-  for (const action of ['update_registration', 'admin_create_user']) assert.match(source, new RegExp(`action === '${action}'[\\s\\S]{0,50}requireRole\\(actor, 'admin'\\)`));
-  assert.match(source, /action === 'export_financial' \|\| action === 'export_audit'[\s\S]{0,60}requireRole\(actor, 'admin'\)/);
+  for (const action of ['update_registration', 'admin_create_user', 'export_financial', 'export_audit']) assert.match(source, new RegExp(`action === '${action}'[\\s\\S]{0,50}requireRole\\(actor, 'admin'\\)`));
   assert.ok(!source.includes('p_password: body.password')); // Only typed validated payloads enter account RPCs.
+});
+test('导出的操作日志标注实际使用的筛选条件，与界面显示一致', () => {
+  const filters = { username: 'admin', event: '登录', ip: '127.0.0.1', start: '2026-10-01', end: '2026-10-31' };
+  assert.equal(auditFilterSummary(filters), '用户名 含「admin」 · 操作 含「登录」 · IP 含「127.0.0.1」 · 2026-10-01 至 2026-10-31');
+  assert.equal(auditFilterSummary({}), '');
+  assert.equal(auditFilterSummary({ start: '', end: '2026-10-31' }), '最早 至 2026-10-31');
+  const sheet = new TextDecoder().decode(unpackTemplate(fillExportTemplate(template('audit'), 'audit', { ...data, filters })).get('xl/worksheets/sheet1.xml'));
+  for (const text of ['admin','登录','127.0.0.1','2026-10-01 至 2026-10-31']) assert.ok(sheet.includes(text));
+  // The date range must come from the filter object and be stated exactly once.
+  assert.ok(sheet.includes('2026-10-01 至 2026-10-31 · 用户名 含「admin」'));
+  assert.equal(sheet.split('2026-10-01 至 2026-10-31').length - 1, 1);
+  assert.ok(!sheet.includes('2026-10-01 至 2026-10-01'));
+});
+test('未使用筛选条件时导出不虚构条件', () => {
+  const sheet = new TextDecoder().decode(unpackTemplate(fillExportTemplate(template('audit'), 'audit', { ...data, start: '', end: '', filters: {} })).get('xl/worksheets/sheet1.xml'));
+  assert.ok(sheet.includes('全部日期 至 现在'));
+  assert.ok(!sheet.includes('含「'));
+  // A date range limit is still reported once when only that range is active.
+  const ranged = new TextDecoder().decode(unpackTemplate(fillExportTemplate(template('audit'), 'audit', { ...data, filters: { start: '2026-10-01', end: '2026-10-31' } })).get('xl/worksheets/sheet1.xml'));
+  assert.ok(ranged.includes('2026-10-01 至 2026-10-31 · 导出时间'));
 });
