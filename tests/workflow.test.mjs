@@ -40,6 +40,12 @@ test('收款码可在付款前更换；付款登记由财委身份完成，普�
   assert.equal(hasRole(financeAdmin, 'finance'), true);
   assert.equal(hasRole(admin, 'admin'), true);
 });
+test('财委可登记本人已审批的申请付款，审批阶段仍不可登记', () => {
+  const financeOwner = { ...owner, roles: ['finance'] };
+  for (const status of ['payment_pending', 'paid']) assert.equal(canRecordPayment(app(status), financeOwner), true);
+  for (const status of ['draft', 'finance_pending', 'chair_pending', 'payment_info_required', 'rejected', 'cancelled']) assert.equal(canRecordPayment(app(status), financeOwner), false);
+  assert.equal(canRecordPayment(app('payment_pending'), owner), false);
+});
 test('保存付款草稿不要求确认，正式提交必须填写流水号且勾选确认', () => {
   assert.equal(validateStep('receipt', '', true, false, false), '');
   assert.notEqual(validateStep('receipt', '', true, true, true), '');
@@ -98,3 +104,4 @@ test('付款登记视同财委：前端、API 与数据库三处判定一致', a
   assert.match(sql, /p_role in \('finance', 'chair', 'cashier'\)\s*\n\s*and private\.app_user_is_superadmin/);
   assert.doesNotMatch(sql, /role = p_role or role = 'admin'/);
 });
+

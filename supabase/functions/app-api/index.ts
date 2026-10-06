@@ -626,7 +626,7 @@ async function handle(req: Request) {
     if (fileResult.error || actionResult.error || paymentResult.error) throw new Error('申请详情读取失败。')
     const visibleFiles = (fileResult.data ?? []).filter((file) => !file.pending ||
       (file.kind === 'qr' && application.owner_id === actor.user.id) ||
-      (file.kind === 'receipt' && application.owner_id !== actor.user.id && hasRole(actor, 'cashier')))
+      (file.kind === 'receipt' && hasRole(actor, 'cashier')))
     return ok({ application, ownerName: profileResult.data?.full_name ?? '成员', files: visibleFiles, actions: actionResult.data ?? [], payment: paymentResult.data ?? null })
   }
 
@@ -666,7 +666,7 @@ async function handle(req: Request) {
     if (applicationError || !application) throw new HttpError('申请不存在。', 404)
     if (kind === 'attachment' && (application.owner_id !== actor.user.id || !['draft','changes_requested','cancelled','finance_pending','chair_pending','payment_info_required','payment_pending'].includes(application.status))) throw new HttpError('当前不能修改申请附件。', 403)
     if (kind === 'qr' && (application.owner_id !== actor.user.id || !['payment_info_required','payment_pending'].includes(application.status))) throw new HttpError('当前不能修改收款信息。', 403)
-    if (kind === 'receipt' && (application.owner_id === actor.user.id || !hasRole(actor, 'cashier') || !['payment_pending','paid'].includes(application.status))) throw new HttpError('没有付款登记权限。', 403)
+    if (kind === 'receipt' && (!hasRole(actor, 'cashier') || !['payment_pending','paid'].includes(application.status))) throw new HttpError('没有付款登记权限。', 403)
     const safeName = file.name.replace(/[^a-zA-Z0-9._-]/g, '_').slice(-120) || 'file'
     const storagePath = `${application.owner_id}/${applicationId}/${kind}-${crypto.randomUUID()}-${safeName}`
     const upload = await admin.storage.from(bucket).upload(storagePath, new Uint8Array(await file.arrayBuffer()), { upsert: false, contentType: file.type || 'application/octet-stream' })
@@ -690,7 +690,7 @@ async function handle(req: Request) {
     const { data: file, error: fileError } = await admin.from('application_files').select('application_id,owner_id,kind,pending').eq('storage_path', path).is('removed_at', null).maybeSingle()
     if (fileError || !file) throw new HttpError('文件不存在。', 404)
     if (file.owner_id !== actor.user.id && actor.roles.length === 0) throw new HttpError('没有权限。', 403)
-    if (file.pending && !((file.kind === 'qr' && file.owner_id === actor.user.id) || (file.kind === 'receipt' && file.owner_id !== actor.user.id && hasRole(actor, 'cashier')))) throw new HttpError('没有草稿文件查看权限。', 403)
+    if (file.pending && !((file.kind === 'qr' && file.owner_id === actor.user.id) || (file.kind === 'receipt' && hasRole(actor, 'cashier')))) throw new HttpError('没有草稿文件查看权限。', 403)
     const { data, error } = await admin.storage.from(bucket).createSignedUrl(path, 300)
     if (error) throw new Error(error.message)
     return ok({ signedUrl: data.signedUrl })
@@ -890,3 +890,4 @@ Deno.serve(async (req) => {
     return fail(error instanceof Error ? error.message : '服务暂时不可用。', 500)
   }
 })
+

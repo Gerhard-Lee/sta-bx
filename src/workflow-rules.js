@@ -9,7 +9,7 @@ export const hasRole = (identity, role) => identity?.roles?.includes(role) === t
 export const isEditable = (application, identity) => application.owner_id === identity.profile.id && ['draft', 'changes_requested', 'cancelled'].includes(application.status);
 export const canEditAttachments = (application, identity) => application.owner_id === identity.profile.id && ['draft', 'changes_requested', 'cancelled', 'finance_pending', 'chair_pending', 'payment_info_required', 'payment_pending'].includes(application.status);
 export const canEditPaymentInfo = (application, identity) => application.owner_id === identity.profile.id && ['payment_info_required', 'payment_pending'].includes(application.status);
-export const canRecordPayment = (application, identity) => application.owner_id !== identity.profile.id && hasRole(identity, 'cashier') && ['payment_pending', 'paid'].includes(application.status);
+export const canRecordPayment = (application, identity) => hasRole(identity, 'cashier') && ['payment_pending', 'paid'].includes(application.status);
 export function validateFile(file, kind = 'attachment') {
   if (file.size === 0) return '不能选择空文件。';
   if (file.size > 5 * 1024 * 1024) return '每个文件不能超过 5 MB。';
@@ -23,3 +23,4 @@ export function validateStep(kind, value, hasFile, confirmed, submit) {
   if (kind === 'receipt' && !confirmed) return '请核对收款人和金额，并确认已完成转账。';
   return '';
 }
+
