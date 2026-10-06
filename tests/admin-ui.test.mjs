@@ -15,7 +15,10 @@ globalThis.__adminRequest = async (action,payload) => { requests.push({action,pa
 const source = readFileSync('src/admin.jsx','utf8')
   .replace(/import React, \{[^}]+\} from 'react';/, 'const {React,useState,useEffect,useRef} = globalThis.__adminHooks;')
   .replace(/import \{ apiRequest \} from '.\/api.js';/, 'const apiRequest = globalThis.__adminRequest;')
-  .replace(/import \{[^}]+\} from '.\/reporting.js';/, "const ROLE_LABEL = {}; const formatDateTime = String, auditDetail = row => row.detail, auditFilterSummary = () => '', downloadExport = () => {};");
+  .replace(/import \{[^}]+\} from '.\/reporting.js';/, "const ROLE_LABEL = {}; const formatDateTime = String, auditDetail = row => row.detail, auditFilterSummary = () => '', downloadExport = () => {};")
+  // 邮件提醒改造给 admin.jsx 加了一条模块级依赖；它只在 AdminPanel 里使用，本文件只测两个目录组件，
+  // 所以按同一手法换成占位常量，否则 data: 模块解析不了这个相对导入。
+  .replace(/import \{[^}]+\} from '.\/notify-rules.js';/, "const NOTIFY_QUEUE = {}, NOTIFY_EVENTS = [], NOTIFY_DEFAULT_EVENTS = [], NOTIFY_EVENT_GROUPS = [], normalizeNotifyEvents = value => value;");
 const {code} = await transform(source,{loader:'jsx',format:'esm'});
 const {MemberDirectory,AuditDirectory} = await import('data:text/javascript;base64,'+Buffer.from(code).toString('base64'));
 async function flushEffects() {

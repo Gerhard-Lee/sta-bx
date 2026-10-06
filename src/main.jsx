@@ -2,6 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import './style.css';
 import { apiRequest } from './api.js';
+import { normalizeEmail, validateEmail } from './notify-rules.js';
 import { ApplicationForm, ApplicationDetail } from './workflow.jsx';
 import { AdminPanel } from './admin.jsx';
 
@@ -24,9 +25,11 @@ function StatusBadge({ status }) { return <span className={`status ${status}`}>{
 function Button({ children, kind = '', ...props }) { return <button className={`button ${kind}`} {...props}>{children}</button>; }
 function Spinner() { return <span className="spinner" aria-label="加载中" />; }
 
-function AccountPanel() {
+function AccountPanel({ identity, onProfileUpdate }) {
   const [passwords, setPasswords] = useState({ current: '', next: '' });
   const [busy, setBusy] = useState(false); const [error, setError] = useState(''); const [notice, setNotice] = useState('');
+  const [email, setEmail] = useState(identity.profile?.email || '');
+  const [emailBusy, setEmailBusy] = useState(false); const [emailError, setEmailError] = useState(''); const [emailNotice, setEmailNotice] = useState('');
   const submit = async (event) => {
     event.preventDefault(); setBusy(true); setError(''); setNotice('');
     try {
@@ -36,8 +39,25 @@ function AccountPanel() {
     } catch (err) { setError(err.message || '密码没有更新，请重试。'); }
     finally { setBusy(false); }
   };
-  return <><div className="heading-row"><div><p className="eyebrow">账户</p><h1>修改密码</h1></div></div>
-    <section className="panel detail-panel account-panel"><p className="muted">更新后，下次登录请使用新密码。</p><form className="stack-form" onSubmit={submit}><fieldset disabled={busy}><label>当前密码<input required type="password" autoComplete="current-password" value={passwords.current} onChange={(e) => setPasswords({ ...passwords, current: e.target.value })} /></label><label>新密码<input required minLength="10" maxLength="72" type="password" autoComplete="new-password" value={passwords.next} onChange={(e) => setPasswords({ ...passwords, next: e.target.value })} /></label><ErrorText error={error} />{notice && <div className="notice" role="status">{notice}</div>}<Button kind="secondary">更新密码</Button></fieldset></form></section>
+  const bindEmail = async (event) => {
+    event.preventDefault(); if (emailBusy) return;
+    const value = email.trim();
+    if (value) { const invalid = validateEmail(value); if (invalid) { setEmailError(invalid); return; } }
+    setEmailBusy(true); setEmailError(''); setEmailNotice('');
+    try {
+      const result = await apiRequest('bind_email', { email: value });
+      if (result.error) throw new Error(result.error.message);
+      // 服务端会把地址去空格转小写，本地也按同样规范显示，避免输入与保存结果不一致。
+      const stored = value ? normalizeEmail(value) : '';
+      setEmail(stored); onProfileUpdate({ email: stored || null });
+      setEmailNotice(value ? '邮箱已更新，申请动态会发送到这个地址。' : '已清除邮箱，将不再收到邮件提醒。');
+    } catch (err) { setEmailError(err.message || '邮箱没有保存，请重试。'); }
+    finally { setEmailBusy(false); }
+  };
+  return <><div className="heading-row"><div><p className="eyebrow">账户</p><h1>账户设置</h1></div></div>
+    <section className="panel detail-panel account-panel"><h2>邮箱提醒</h2><p className="muted">是否收到邮件提醒由管理员在设置里配置：待办类（轮到你审批、你的申请被退回待修改、要你补充收款信息）默认开启；结果类（申请被拒绝、已完成打款）默认关闭，管理员需要时会打开。</p><p className="hint">地址由本人填写，系统不验证邮箱归属，也不会提示退信：填错就只是收不到提醒，请填常用邮箱（QQ、微信或学校邮箱到达率最好）。提醒内容会包含申请人、部门与金额，只有需要你处理的人才会收到。</p>
+      <form className="stack-form" onSubmit={bindEmail}><fieldset disabled={emailBusy}><label>邮箱地址<input type="email" maxLength="254" autoComplete="email" value={email} onChange={(e) => setEmail(e.target.value)} placeholder="例如 you@example.com" /></label><ErrorText error={emailError} />{emailNotice && <div className="notice" role="status">{emailNotice}</div>}<Button kind="secondary">保存邮箱</Button></fieldset></form></section>
+    <section className="panel detail-panel account-panel"><h2>修改密码</h2><p className="muted">更新后，下次登录请使用新密码。</p><form className="stack-form" onSubmit={submit}><fieldset disabled={busy}><label>当前密码<input required type="password" autoComplete="current-password" value={passwords.current} onChange={(e) => setPasswords({ ...passwords, current: e.target.value })} /></label><label>新密码<input required minLength="10" maxLength="72" type="password" autoComplete="new-password" value={passwords.next} onChange={(e) => setPasswords({ ...passwords, next: e.target.value })} /></label><ErrorText error={error} />{notice && <div className="notice" role="status">{notice}</div>}<Button kind="secondary">更新密码</Button></fieldset></form></section>
   </>;
 }
 
@@ -99,10 +119,10 @@ function App() {
   if (session === undefined || (session && !identity && !identityError)) return <main className="loading-page"><Spinner /></main>;
   if (!session) return <AuthScreen />;
   if (identityError) return <main className="auth-page"><section className="auth-card"><h1>账号信息加载失败</h1><ErrorText error={identityError} /><Button onClick={() => window.location.reload()}>重新加载</Button></section></main>;
-  return <Workspace session={session} identity={identity} />;
+  return <Workspace session={session} identity={identity} onProfileUpdate={(patch) => setIdentity((current) => current ? { ...current, profile: { ...current.profile, ...patch } } : current)} />;
 }
 
-function Workspace({ session, identity }) {
+function Workspace({ session, identity, onProfileUpdate }) {
   const [view, setView] = useState('dashboard');
   const [selectedId, setSelectedId] = useState(null);
   const [refreshKey, setRefreshKey] = useState(0);
@@ -112,10 +132,10 @@ function Workspace({ session, identity }) {
   const logout = async () => { await apiRequest('logout'); localStorage.removeItem(SESSION_KEY); window.location.reload(); };
   return <div className="app-shell">
     <header className="topbar"><button className="brand-button" onClick={() => open('dashboard')}><Brand /></button>
-      <nav><button className={view === 'dashboard' ? 'current' : ''} onClick={() => open('dashboard')}>我的申请</button>{roles.length > 0 && <button className={view === 'team' ? 'current' : ''} onClick={() => open('team')}>工作台</button>}{roles.includes('admin') && <button className={view === 'admin' ? 'current' : ''} onClick={() => open('admin')}>设置</button>}<button className={view === 'account' ? 'current' : ''} onClick={() => open('account')}>修改密码</button></nav>
+      <nav><button className={view === 'dashboard' ? 'current' : ''} onClick={() => open('dashboard')}>我的申请</button>{roles.length > 0 && <button className={view === 'team' ? 'current' : ''} onClick={() => open('team')}>工作台</button>}{roles.includes('admin') && <button className={view === 'admin' ? 'current' : ''} onClick={() => open('admin')}>设置</button>}<button className={view === 'account' ? 'current' : ''} onClick={() => open('account')}>账户设置</button></nav>
       <div className="user-menu"><span>{identity.profile?.full_name || session.user.username}</span><button className="logout" onClick={logout}>退出</button></div>
     </header>
-    <main className="content">{view === 'dashboard' || view === 'team' ? <Dashboard identity={identity} team={view === 'team'} onOpen={open} refreshKey={refreshKey} /> : view === 'new' ? <ApplicationForm identity={identity} onDone={(id) => { refresh(); open('detail', id); }} onCancel={() => open('dashboard')} /> : view === 'detail' ? <ApplicationDetail id={selectedId} identity={identity} onBack={() => open('dashboard')} onRefresh={refresh} /> : view === 'account' ? <AccountPanel /> : <AdminPanel identity={identity} />}</main>
+    <main className="content">{view === 'dashboard' || view === 'team' ? <Dashboard identity={identity} team={view === 'team'} onOpen={open} refreshKey={refreshKey} /> : view === 'new' ? <ApplicationForm identity={identity} onDone={(id) => { refresh(); open('detail', id); }} onCancel={() => open('dashboard')} /> : view === 'detail' ? <ApplicationDetail id={selectedId} identity={identity} onBack={() => open('dashboard')} onRefresh={refresh} /> : view === 'account' ? <AccountPanel identity={identity} onProfileUpdate={onProfileUpdate} /> : <AdminPanel identity={identity} />}</main>
     <footer>成都七中科学技术协会 财务报销平台 · 本网站由 网络部 搭建运营 · 版本号 1.0.0</footer>
   </div>;
 }

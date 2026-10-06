@@ -32,7 +32,8 @@ test('同一状态下再次提交文件不复用已经提交的草稿，处理�
 test('修改密码对所有登录用户可见，不依赖管理员设置', () => {
   const main=source('src/main.jsx'); const admin=source('src/admin.jsx');
   assert.match(main,/view === 'account'/);
-  assert.match(main,/>修改密码<\/button>/);
+  assert.match(main,/>账户设置<\/button>/); // 账户页同时承载邮箱绑定，入口不再只叫修改密码
+  assert.match(main,/<h2>修改密码<\/h2>/);
   assert.match(main,/apiRequest\('change_password'/);
   assert.doesNotMatch(admin,/<h2>修改密码<\/h2>/);
 });

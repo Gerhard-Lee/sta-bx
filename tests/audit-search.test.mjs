@@ -5,7 +5,9 @@ import { transform } from 'esbuild';
 
 // Execute the actual Edge handler; only the Supabase transport and Deno host are mocked.
 const source = readFileSync('supabase/functions/app-api/index.ts', 'utf8');
-const transformed = source.replace(/import \{ createClient \} from '[^']+'\n/, 'const createClient = globalThis.__auditClient;\n');
+// Windows 上 core.autocrlf 会把工作区副本转成 CRLF，按行锚定的正则会静默失配（CI 的 Linux 上看不出来），
+// 所以这里只锚定到行尾、不假设换行符。改错时 transformed 仍带着 npm: 导入，用例会以 ERR_UNSUPPORTED_ESM_URL_SCHEME 失败。
+const transformed = source.replace(/import \{ createClient \} from '[^']+'\r?\n/, 'const createClient = globalThis.__auditClient;\n');
 let handler, actorRoles = ['admin'], queries, rpcCalls, rpcResult;
 globalThis.Deno = { env: { get: () => '' }, serve: (fn) => { handler = fn; } };
 globalThis.__auditClient = () => ({
@@ -16,7 +18,7 @@ globalThis.__auditClient = () => ({
       : table === 'user_roles' ? actorRoles.map(role => ({role}))
       : table === 'settings' ? { threshold: 100, registration_enabled: true } : null;
     const query = { then(resolve, reject) { return Promise.resolve({data, error:null}).then(resolve, reject); } };
-    for (const method of ['select', 'eq', 'maybeSingle', 'single', 'update', 'insert', 'delete', 'order', 'range']) query[method] = () => query;
+    for (const method of ['select', 'eq', 'maybeSingle', 'single', 'update', 'insert', 'delete', 'order', 'range', 'limit']) query[method] = () => query;
     return query;
   },
   async rpc(name, args) { rpcCalls.push({name, args}); return rpcResult(name, args); },

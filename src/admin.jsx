@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { apiRequest } from './api.js';
 import { ROLE_LABEL, formatDateTime, auditDetail, auditFilterSummary, downloadExport } from './reporting.js';
+import { NOTIFY_QUEUE, NOTIFY_EVENTS, NOTIFY_DEFAULT_EVENTS, NOTIFY_EVENT_GROUPS, normalizeNotifyEvents } from './notify-rules.js';
 
 const Button = ({ kind = '', children, ...props }) => <button className={`button ${kind}`} {...props}>{children}</button>;
 const ErrorText = ({ children }) => children ? <div className="error-text" role="alert">{children}</div> : null;
@@ -23,11 +24,11 @@ export function MemberRow({ profile, roles, busy, onSave, self = false }) {
   const signature = [...roles].sort().join(',');
   const [selected, setSelected] = useState(new Set(roles)); const [active, setActive] = useState(profile.active);
   useEffect(() => { setSelected(new Set(signature.split(',').filter(Boolean))); setActive(profile.active); }, [profile.id, profile.active, signature]);
-  return <div className="member-row"><div><strong>{profile.full_name || profile.username}</strong><p className="muted">@{profile.username} · {profile.department || '未填写部门'}{self ? ' · 当前账号' : ''}</p></div>
+  return <div className="member-row"><div><strong>{profile.full_name || profile.username}</strong><p className="muted">@{profile.username} · {profile.department || '未填写部门'}{profile.has_email ? '' : ' · 未绑定邮箱'}{self ? ' · 当前账号' : ''}</p></div>
     {self || protectedAccount ? <span className="muted">{protectedAccount ? '超级管理员 · 权限已锁定' : '管理员'}</span> : <fieldset disabled={busy} className="member-roles">{Object.entries(ROLE_LABEL).map(([role, label]) => <label className="check-row" key={role}><input type="checkbox" checked={selected.has(role)} onChange={(e) => { const next = new Set(selected); e.target.checked ? next.add(role) : next.delete(role); setSelected(next); }} />{label}</label>)}<label className="check-row"><input type="checkbox" checked={active} onChange={(e) => setActive(e.target.checked)} />启用</label><Button kind="secondary" type="button" onClick={() => onSave(profile.id, [...selected], active)}>保存</Button></fieldset>}
   </div>;
 }
-const emptyUser = () => ({ username: '', password: '', full_name: '', department: '', roles: [] });
+const emptyUser = () => ({ username: '', password: '', full_name: '', department: '', email: '', roles: [] });
 export function MemberDirectory({ identity, busy, revision, onSave }) {
   const [filters, setFilters] = useState({ query: '', role: '', active: '' });
   const [page, setPage] = useState(1); const [pageSize, setPageSize] = useState(10);
@@ -135,6 +136,8 @@ export function AuditDirectory({ identity, revision, filters, onFiltersChange, f
 
 export function AdminPanel({ identity }) {
   const [data, setData] = useState(null); const [threshold, setThreshold] = useState('100'); const [registration, setRegistration] = useState(true);
+  const [emailNotify, setEmailNotify] = useState(false);
+  const [emailEvents, setEmailEvents] = useState([...NOTIFY_DEFAULT_EVENTS]);
   const [newUser, setNewUser] = useState(emptyUser);
   const [auditFilters, setAuditFilters] = useState({ ...NO_AUDIT_FILTERS });
   // The audit export and the audit list read the same filter object, so they can never disagree.
@@ -145,7 +148,7 @@ export function AdminPanel({ identity }) {
   const [period, setPeriod] = useState({ start: '', end: '', opening: '' }); const [error, setError] = useState(''); const [notice, setNotice] = useState(''); const [busy, setBusy] = useState(false); const lock = useRef(false);
   const load = async () => {
     const result = await apiRequest('admin_data'); if (result.error) throw new Error(result.error.message);
-    setData(result.data); setThreshold(String(result.data.threshold)); setRegistration(result.data.registration_enabled);
+    setData(result.data); setThreshold(String(result.data.threshold)); setRegistration(result.data.registration_enabled); setEmailNotify(result.data.email_notify_enabled === true); setEmailEvents(normalizeNotifyEvents(result.data.email_notify_events));
   };
   useEffect(() => { if (identity.roles.includes('admin')) load().catch((err) => setError(err.message)); }, []);
   const run = async (task, message) => {
@@ -169,15 +172,19 @@ export function AdminPanel({ identity }) {
     await downloadExport('audit', await request('export_audit', { start: period.start, end: period.end }));
   }, '文件已生成，下载已开始。');
   if (!identity.roles.includes('admin')) return <div className="panel-empty"><h2>没有权限</h2></div>;
+  // 后端未随前端一起部署时字段会缺失（包括新增的“已作废”），逐字段兜底，避免整页白屏或显示 undefined。
+  const queue = { pending: 0, sending: 0, sent: 0, failed: 0, cancelled: 0, ...(data?.notifications ?? {}) };
+  const failures = data?.failures ?? [];
   return <><div className="heading-row"><div><p className="eyebrow">组织管理</p><h1>设置</h1></div></div>
     <ErrorText>{error}</ErrorText>{notice && <div className="notice" role="status">{notice}</div>}
     {!data ? <div className="panel-empty">加载中…</div> : <>
       <div className="settings-grid admin-settings">
         <section className="panel detail-panel"><h2>注册设置</h2><form onSubmit={(e) => { e.preventDefault(); run(() => request('update_registration', { enabled: registration }), '注册设置已保存。'); }}><fieldset disabled={busy}><label className="check-row registration-switch"><input type="checkbox" role="switch" checked={registration} onChange={(e) => setRegistration(e.target.checked)} />允许新用户注册</label><p className="hint">关闭后，已有用户仍可登录，管理员仍可添加用户。</p><Button kind="secondary">保存设置</Button></fieldset></form></section>
+        <section className="panel detail-panel"><h2>邮件通知</h2><form onSubmit={(e) => { e.preventDefault(); run(() => request('update_email_notify', { enabled: emailNotify, events: emailEvents }), '邮件通知设置已保存。'); }}><fieldset disabled={busy}><label className="check-row registration-switch"><input type="checkbox" role="switch" checked={emailNotify} onChange={(e) => setEmailNotify(e.target.checked)} />启用邮件提醒</label><p className="hint">总开关之外按类型勾选：待办类发给对应身份成员（审批、付款登记）或申请人本人（退回修改、待补充收款码，后者即"已通过审批，请补充收款信息"）；结果类（拒绝申请、已付款）只发给申请人本人，默认不勾选，需要时打开。取消勾选的类型不再生成新提醒，已经积压但尚未发出的也会在下一次消费时作废。关闭总开关时不生成新提醒，超过 {NOTIFY_QUEUE.maxAgeHours} 小时仍未发送的提醒会被丢弃。邮件服务密钥由项目负责人在服务端配置，收件人只包含申请中可见的信息。</p><div className="notify-event-groups">{NOTIFY_EVENT_GROUPS.map((group) => <div className="notify-event-group" key={group.title}><span className="notify-event-title">{group.title}<small>{group.hint}</small></span>{group.events.map((event) => <label className="check-row" key={event}><input type="checkbox" checked={emailEvents.includes(event)} onChange={(e) => setEmailEvents(normalizeNotifyEvents(e.target.checked ? [...emailEvents, event] : emailEvents.filter((item) => item !== event)))} />{event}</label>)}</div>)}</div><p className="muted">已勾选 {emailEvents.length} / {NOTIFY_EVENTS.length} 类提醒；保存后立即生效，改动会写入操作日志。</p><p className="hint">队列由定时任务定期消费；没有配置定时任务时，请点“立即发送”。「已作废」表示提醒发出前申请状态已经变化（或收款信息被更换、收件人身份被撤销、该类提醒被关闭），这些提醒不会再发，也不占用去重名额。</p>{data.email_service_configured === false && <p className="hint warn">服务端尚未配置 EMAIL_API_URL、EMAIL_API_KEY 与 EMAIL_FROM，队列暂时发不出去。</p>}<p className="muted">队列：待发送 {queue.pending} 封 · 发送中 {queue.sending} 封 · 已发送 {queue.sent} 封 · 失败 {queue.failed} 封 · 已作废 {queue.cancelled} 封</p>{failures.length > 0 && <ul className="queue-failures">{failures.map((item) => <li key={item.id}>@{item.username} · {item.event} · 尝试 {item.attempts} 次 · {item.last_error}</li>)}</ul>}<div className="form-actions"><Button kind="secondary">保存设置</Button><Button type="button" onClick={() => run(() => request('send_notifications', {}), '队列已处理，数量见上方统计。')}>立即发送</Button>{failures.length > 0 && <Button type="button" kind="secondary" onClick={() => run(() => request('reset_notifications', {}), '失败提醒已重新排队。')}>失败项重新排队</Button>}</div></fieldset></form></section>
         <section className="panel detail-panel"><h2>金额设置</h2><form className="stack-form" onSubmit={(e) => { e.preventDefault(); run(() => request('update_threshold', { threshold: Number(threshold) }), '金额设置已保存。'); }}><fieldset disabled={busy}><label>主席处理起始金额（元）<input required type="number" min="0.01" max="10000000" step="0.01" value={threshold} onChange={(e) => setThreshold(e.target.value)} /></label><Button kind="secondary">保存设置</Button></fieldset></form></section>
         <section className="panel detail-panel"><h2>添加用户</h2><form className="stack-form" onSubmit={(e) => { e.preventDefault(); run(async () => { await request('admin_create_user', newUser); setNewUser(emptyUser()); }, '用户已添加，可使用初始密码登录。'); }}><fieldset disabled={busy}>
           <div className="form-grid"><label>用户名<input required minLength="3" maxLength="40" pattern="[A-Za-z0-9][A-Za-z0-9_.-]{2,39}" autoComplete="off" value={newUser.username} onChange={(e) => setNewUser({ ...newUser, username: e.target.value })} /></label><label>姓名<input required maxLength="80" value={newUser.full_name} onChange={(e) => setNewUser({ ...newUser, full_name: e.target.value })} /></label></div>
-          <label>部门 / 活动<input maxLength="80" value={newUser.department} onChange={(e) => setNewUser({ ...newUser, department: e.target.value })} /></label><label>初始密码<input required type="password" minLength="10" maxLength="72" autoComplete="new-password" value={newUser.password} onChange={(e) => setNewUser({ ...newUser, password: e.target.value })} placeholder="10–72 个字符" /></label>
+          <label>部门 / 活动<input maxLength="80" value={newUser.department} onChange={(e) => setNewUser({ ...newUser, department: e.target.value })} /></label><label>邮箱（可选，用于接收待办提醒）<input type="email" maxLength="254" autoComplete="off" value={newUser.email} onChange={(e) => setNewUser({ ...newUser, email: e.target.value })} placeholder="例如 you@example.com" /></label><label>初始密码<input required type="password" minLength="10" maxLength="72" autoComplete="new-password" value={newUser.password} onChange={(e) => setNewUser({ ...newUser, password: e.target.value })} placeholder="10–72 个字符" /></label>
           <div className="role-choices">{Object.entries(ROLE_LABEL).map(([role, label]) => <label className="check-row" key={role}><input type="checkbox" checked={newUser.roles.includes(role)} onChange={(e) => setNewUser({ ...newUser, roles: e.target.checked ? [...newUser.roles, role] : newUser.roles.filter((r) => r !== role) })} />{label}</label>)}</div><p className="hint">不选择角色时，为普通用户。</p><Button>添加用户</Button>
         </fieldset></form></section>
         <section className="panel detail-panel"><h2>数据导出</h2><fieldset disabled={busy}><div className="form-grid"><label>开始日期<input type="date" value={period.start} onChange={(e) => setPeriod({ ...period, start: e.target.value })} /></label><label>结束日期<input type="date" value={period.end} onChange={(e) => setPeriod({ ...period, end: e.target.value })} /></label></div><label>期初余额（元，可不填）<input type="number" step="0.01" value={period.opening} onChange={(e) => setPeriod({ ...period, opening: e.target.value })} /></label><p className="hint">财报仅含已付款报销。不填写期初余额时，收入及余额留空。</p><div className="export-actions"><Button type="button" onClick={() => exportReport('financial')}>导出财报</Button><Button type="button" kind="secondary" onClick={() => exportPeriodAudit()}>按日期导出操作日志</Button></div></fieldset>

@@ -18,6 +18,9 @@ reference.png
 supabase/.temp/
 supabase/.branches/
 
+# 测试运行期生成的转译产物（tests/app-api-notify.test.mjs 会在用例结束后删除；进程被杀时留个兜底）
+tests/.tmp/
+
 # 部署平台
 .vercel
 
