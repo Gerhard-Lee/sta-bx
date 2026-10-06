@@ -18,7 +18,7 @@ globalThis.__auditClient = () => ({
       : table === 'user_roles' ? actorRoles.map(role => ({role}))
       : table === 'settings' ? { threshold: 100, registration_enabled: true } : null;
     const query = { then(resolve, reject) { return Promise.resolve({data, error:null}).then(resolve, reject); } };
-    for (const method of ['select', 'eq', 'maybeSingle', 'single', 'update', 'insert', 'delete', 'order', 'range', 'limit']) query[method] = () => query;
+    for (const method of ['select', 'eq', 'maybeSingle', 'single', 'update', 'insert', 'delete', 'order', 'range', 'limit', 'in']) query[method] = () => query;
     return query;
   },
   async rpc(name, args) { rpcCalls.push({name, args}); return rpcResult(name, args); },
@@ -49,6 +49,7 @@ test('日志列表将全部筛选和快照交给共享 RPC', async () => {
 test('兼容 admin_data 通过共享投影返回日志，不能绕过权限', async () => {
   reset();
   const result = await request({action:'admin_data'});
+  assert.equal(result.status,200);
   assert.deepEqual(result.data.audit,[limitedRow]);
   assert.equal(result.data.scope,'limited');
   assert.ok(!queries.includes('audit_logs'));

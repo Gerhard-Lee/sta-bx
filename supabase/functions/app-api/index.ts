@@ -515,6 +515,70 @@ async function handle(req: Request) {
     return ok({ sent, failed, retried, cancelled, deferred, discarded, stale, recheck_failed: recheckFailures, rounds, pending: pendingLeft ?? 0 })
   }
 
+  // 每轮最多 3 条、每次 HTTP 5 秒，给现有邮件消费保留运行预算。
+  const drainQqNotifications = async (actorId: string | null) => {
+    const appId = (Deno.env.get('QQ_BOT_APP_ID') ?? '').trim()
+    const appSecret = (Deno.env.get('QQ_BOT_APP_SECRET') ?? '').trim()
+    if (!appId || !appSecret) return { sent: 0, skipped: true, message: 'QQ机器人服务尚未配置。' }
+    const { data: settings, error } = await admin.from('settings').select('qq_notify_enabled').eq('id', 1).single()
+    if (error) throw new Error('QQ提醒设置读取失败。')
+    if (!settings.qq_notify_enabled) return { sent: 0, skipped: true, message: 'QQ提醒已关闭。' }
+    // 领取前取 token；认证失败时不消耗队列的重试次数。
+    const apiBase = Deno.env.get('QQ_BOT_SANDBOX') === 'true' ? 'https://sandbox.api.sgroup.qq.com' : 'https://api.bot.qq.com'
+    const tokenResponse = await fetch('https://api.bot.qq.com/app/getAppAccessToken', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ appId, clientSecret: appSecret }), signal: AbortSignal.timeout(5000),
+    })
+    const tokenData = await tokenResponse.json().catch(() => ({}))
+    if (!tokenResponse.ok || !tokenData.access_token) throw new HttpError(`QQ机器人认证失败（HTTP ${tokenResponse.status}，code ${String(tokenData.code ?? 'unknown')}）。`, 503)
+    const claimId = crypto.randomUUID()
+    const rows = await rpc('app_claim_qq_notifications', { p_claim_id: claimId })
+    let sent = 0, failed = 0, retried = 0, deferred = 0
+    let throttle = false
+    for (const note of Array.isArray(rows) ? rows : []) {
+      const settle = async (fields: Record<string, unknown>) => {
+        const result = await admin.from('qq_notifications').update({ ...fields, claim_id: null })
+          .eq('id', note.id).eq('status', 'sending').eq('claim_id', claimId).select('id')
+        if (result.error) throw new Error('QQ提醒结果保存失败。')
+        return result.data?.length === 1
+      }
+      let allowed = false
+      try { allowed = await rpc('app_verify_qq_notification', { p_id: note.id, p_claim_id: claimId }) === true } catch { /* 复核失败不发送 */ }
+      if (!allowed || throttle) {
+        // 复核不放行时保留 pending，由下一轮取消失效行；不会恢复已作废/换批次的行。
+        if (await settle({ status: 'pending', attempts: note.attempts - 1, next_attempt_at: new Date(Date.now() + 600000).toISOString(), last_error: '本轮未投递，等待重新复核' })) deferred++
+        continue
+      }
+      let errorText = ''
+      try {
+        const appUrl = (Deno.env.get('APP_URL') ?? '').trim()
+        const response = await fetch(`${apiBase}/v2/groups/${encodeURIComponent(note.group_openid)}/messages`, {
+          method: 'POST', headers: { 'content-type': 'application/json', authorization: `QQBot ${tokenData.access_token}` },
+          body: JSON.stringify({ msg_type: 0, content: `【财务报销平台】有新的「${note.event}」动态，请相关成员登录平台查看。${appUrl ? `\n${appUrl}` : ''}` }),
+          signal: AbortSignal.timeout(5000),
+        })
+        const result = await response.json().catch(() => ({}))
+        if (response.status === 429) {
+          throttle = true
+          if (await settle({ status: 'pending', attempts: note.attempts - 1, next_attempt_at: new Date(Date.now() + 600000).toISOString(), last_error: 'QQ服务限频，10分钟后重试' })) retried++
+          continue
+        }
+        // HTTP 200 也必须有消息 ID；只记录状态/错误码，避免上游响应泄露密钥。
+        if (!response.ok || !result.id || [result.code, result.err_code].some((code) => code != null && Number(code) !== 0)) errorText = `QQ发送失败：HTTP ${response.status}，code ${String(result.code ?? result.err_code ?? 'unknown').slice(0, 40)}（请检查群主动消息权限、OpenID及IP白名单）`
+      } catch { errorText = 'QQ服务请求失败或超时' }
+      if (!errorText) {
+        if (await settle({ status: 'sent', sent_at: new Date().toISOString(), last_error: '' })) sent++
+      } else {
+        const exhausted = note.attempts >= 5
+        if (await settle({ status: exhausted ? 'failed' : 'pending', last_error: errorText, next_attempt_at: new Date(Date.now() + Math.min(2 ** note.attempts, 60) * 60000).toISOString() })) {
+          if (exhausted) failed++; else retried++
+        }
+      }
+    }
+    await audit(actorId, '发送QQ提醒', `发送 ${sent} 条，失败 ${failed} 条，重试 ${retried} 条，暂缓 ${deferred} 条`)
+    return { sent, failed, retried, deferred }
+  }
+
   if (action === 'public_settings') {
     const { data, error } = await admin.from('settings').select('registration_enabled').eq('id', 1).single()
     if (error) throw new Error('注册设置读取失败。')
@@ -552,13 +616,18 @@ async function handle(req: Request) {
     return ok(null)
   }
 
-  // 定时任务没有用户会话：pg_cron（或控制台 Scheduled Functions）只能调用“消费邮件队列”这一个动作，
+  // 定时任务没有用户会话：pg_cron（或控制台 Scheduled Functions）只能调用“消费提醒队列”这一个动作，
   // 并且必须携带与 Edge Function 密钥 CRON_SECRET 完全相同的 x-app-cron 头；其它动作一律要求登录。
   const cronHeader = (req.headers.get('x-app-cron') ?? '').trim()
   if (action === 'send_notifications' && cronHeader) {
     const cronSecret = (Deno.env.get('CRON_SECRET') ?? '').trim()
     if (!cronSecret || !sameSecret(cronHeader, cronSecret)) throw new HttpError('定时密钥不正确。', 401)
     admin = createAdmin(req, requestId, action)
+    // QQ 异常单独记账，仍继续消费邮件。
+    try { await drainQqNotifications(null) } catch {
+      try { await audit(null, '发送QQ提醒失败', 'QQ服务或队列处理失败，请检查服务端配置和队列错误。') }
+      catch { console.error('QQ提醒失败日志保存失败') }
+    }
     return await drainNotifications(null)
   }
 
@@ -700,7 +769,7 @@ async function handle(req: Request) {
     requireRole(actor, 'admin')
     const emailServiceReady = Boolean((Deno.env.get('EMAIL_API_URL') ?? '').trim() && (Deno.env.get('EMAIL_API_KEY') ?? '').trim() && (Deno.env.get('EMAIL_FROM') ?? '').trim())
     const [settingResult, auditResult, pendingResult, sendingResult, sentResult, failedResult, cancelledResult] = await Promise.all([
-      admin.from('settings').select('threshold,registration_enabled,email_notify_enabled,email_notify_events').eq('id', 1).single(),
+      admin.from('settings').select('threshold,registration_enabled,email_notify_enabled,email_notify_events,qq_notify_enabled,qq_group_openid,qq_notify_events').eq('id', 1).single(),
       rpc('app_list_audit_logs', { p_actor_id: actor.user.id, p_page_size: 50 }),
       admin.from('notifications').select('*', { count: 'exact', head: true }).eq('status', 'pending'),
       admin.from('notifications').select('*', { count: 'exact', head: true }).eq('status', 'sending'),
@@ -721,7 +790,14 @@ async function handle(req: Request) {
     const failureNames = new Map((recipientsResult.data ?? []).map((user) => [user.id, user.username]))
     // 失败明细只回传事件、尝试次数、原因和账号名，不回传邮箱地址。
     const failures = failureRows.map((row) => ({ id: row.id, event: row.event, attempts: row.attempts, last_error: row.last_error, username: failureNames.get(row.recipient_user_id) ?? '成员', created_at: row.created_at }))
+    const qqResult = await admin.from('qq_notifications').select('id,event,status,attempts,last_error').in('status', ['pending','sending','failed']).order('id', { ascending: false }).limit(10)
+    if (qqResult.error) throw new Error('QQ提醒队列读取失败。')
     return ok({
+      qq_notify_enabled: settingResult.data.qq_notify_enabled,
+      qq_group_openid: settingResult.data.qq_group_openid,
+      qq_notify_events: settingResult.data.qq_notify_events,
+      qq_service_configured: Boolean(Deno.env.get('QQ_BOT_APP_ID') && Deno.env.get('QQ_BOT_APP_SECRET')),
+      qq_queue: qqResult.data,
       threshold: settingResult.data.threshold,
       registration_enabled: settingResult.data.registration_enabled,
       email_notify_enabled: settingResult.data.email_notify_enabled,
@@ -847,6 +923,21 @@ async function handle(req: Request) {
     // 收件人只能是当前登录账号自己；请求体里的任何用户编号都不参与绑定，数据库层也会再校验一次。
     await rpc('app_bind_email', { p_actor_id: actor.user.id, p_user_id: actor.user.id, p_email: String(body.email ?? '').trim() })
     return ok(null)
+  }
+
+  if (action === 'update_qq_notify') {
+    requireRole(actor, 'admin')
+    if (typeof body.enabled !== 'boolean' || !Array.isArray(body.events) || body.events.length > 7) throw new HttpError('QQ提醒设置无效。')
+    await rpc('app_update_qq_notify', { p_actor_id: actor.user.id, p_enabled: body.enabled, p_group_openid: String(body.group_openid ?? '').trim(), p_events: body.events.map(String) })
+    return ok(null)
+  }
+  if (action === 'reset_qq_notifications') {
+    requireRole(actor, 'admin')
+    return ok({ reset: await rpc('app_reset_qq_notifications', { p_actor_id: actor.user.id }) })
+  }
+  if (action === 'send_qq_notifications') {
+    requireRole(actor, 'admin')
+    return ok(await drainQqNotifications(actor.user.id))
   }
 
   if (action === 'update_email_notify') {
